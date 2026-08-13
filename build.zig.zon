@@ -1,0 +1,14 @@
+.{
+    .name = .z_channel,
+    .version = "0.0.0",
+    .fingerprint = 0x3017edb6863460ff,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "example",
+        "z_core",
+        "z_lib",
+    },
+}
