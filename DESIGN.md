@@ -1,7 +1,7 @@
 # ZigPack：零拷贝跨语言二进制序列化格式
 
 > **状态**：设计草稿，待技术评审
-> **版本**：v0.5.1（正确性修订：对齐判定改用 struct_buf 绝对偏移、optional 零扩展位编码；格式优化：数组数据区统一 +8、uniform 大数组头落 32k+24；表述收紧：Writer 四阶段、外语双构造器）
+> **版本**：v0.5.2（正确性修订：对齐判定改用 struct_buf 绝对偏移、optional 零扩展位编码；格式优化：数组数据区统一 +8、uniform 大数组头落 32k+24；表述收紧：Writer 四阶段、外语双构造器、non-uniform 元素泛化为任意子对象）
 > **作者**：待填写
 > **日期**：2026-08-14
 
@@ -184,8 +184,8 @@ Offset  大小                        内容
 > |---|---|---|
 > | 嵌套 struct | 父 struct 的 variable data 区 | 8B |
 > | full-width optional 数据块（`?u64/?i64/?f64`） | 父 struct 的 variable data 区 | 8B |
-> | 数组（数组头） | 父 struct 的 variable data 区 | 见 4.6（uniform 大数组 `32k+24`，其余 8B） |
-> | **数组元素（non-uniform 路径的子 struct）** | **数组 offset_table 之后的元素区** | **8B** |
+> | 数组（数组头） | 父对象的 variable data 区 / 上层数组的元素区 | 见 4.6（uniform 大数组 `32k+24`，其余 8B） |
+> | **数组元素（non-uniform 路径的子对象：子 struct 或嵌套 array）** | **数组 offset_table 之后的元素区** | **子 struct = 8B；嵌套 array 见 4.6** |
 >
 > writer 在追加每个子对象前插入 padding；引用该子对象的条目（父 struct 的 VOT 条目 / 数组的 offset_table 条目）指向 padding **之后**的起点。
 >
@@ -403,14 +403,17 @@ Offset  大小                内容
 [uniform string path，如 [][]const u8]
 8       element_count × 4B          紧密排列的 string_off（u32），element_type = String
 
-[non-uniform / struct array path]
+[non-uniform path，元素为变长子对象：struct 数组、嵌套数组]
 8       element_count × 4B          offset_table[]（各元素相对数组头偏移）
-?       element data[]              各元素 inline struct 数据（每元素 8B 落位，见 4.4）
+?       element data[]              各元素 inline 的子对象数据（子 struct 或嵌套 array，
+                                    每元素按 4.4 规则落位）
 ```
 
 **数据区永远位于数组头 +8**——uniform 路径的裸元素区、non-uniform 路径的 offset_table 都从 +8 开始。访问器无分支、偏移恒为 comptime 常量，三条路径共用同一条寻址公式。
 
-**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（element_type 取 TypeTag 的 String 值，见 5.1），元素紧密连续、无 per-element 头。访问器可返回 `[]const u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。嵌套 struct 数组走 non-uniform 路径（元素是完整的子 struct，需 offset table 定位）。
+**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（element_type 取 TypeTag 的 String 值，见 5.1），元素紧密连续、无 per-element 头。访问器可返回 `[]const u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。
+
+**non-uniform 路径的元素可以是任意变长子对象**：嵌套 struct 数组（`[]Address`）的元素是子 struct；**嵌套数组**（`[][]f32`、`[][]Address`）的元素是完整的子数组（含自己的 8B 数组头 + 数据区，`element_type = Array`）。两者共用同一套机制——offset_table 定位 + 4.4 的统一落位规则，递归任意深度成立，格式无需为嵌套数组增加特例。
 
 > **字符串数组做 SIMD 对齐为何有意义**：String Pool 做了去重，因此**字符串相等 ⟺ string_off 相等**。`tags.contains(s)` 可退化为：先 `intern(s)` 得到 u32 偏移，再对 `[]const u32` 做 SIMD 相等比较（AVX2 一次比 8 个），完全不触碰 pool_data。这使 uniform string array 的向量化有真实业务语义，对齐收益成立。
 
@@ -421,7 +424,7 @@ Offset  大小                内容
 writer 决定数组头在 struct 段缓冲中的落位，**判定基于 struct_buf 绝对偏移**（见 4.4 对齐规则）：
 
 ```
-【仅 uniform 路径】（element_type 为标量或 String，元素宽度 sizeof(elem) 有定义）
+【uniform 路径】（element_type 为标量或 String，元素定宽、sizeof(elem) 有定义）
   若 element_count × sizeof(elem) ≥ 32：
       数组头对齐到 32k + 24  →  数据区（头 +8）起于 32(k+1)，天然 32B 对齐
       置 flags bit1 = 1
@@ -429,11 +432,11 @@ writer 决定数组头在 struct 段缓冲中的落位，**判定基于 struct_b
       数组头对齐到 8B        →  仅保证元素自然对齐
       置 flags bit1 = 0
 
-【non-uniform 路径】（struct 数组）
+【non-uniform 路径】（元素为变长子对象：struct 数组、嵌套数组）
   数组头一律对齐到 8B，flags bit1 = 0
 ```
 
-> **non-uniform 数组为何不做 32B 对齐**：其元素是变长子 struct，逐个通过 offset_table 定位后按字段访问，**不存在整块 SIMD 消费**，对齐无收益；且 `sizeof(elem)` 对变长 struct 无定义，上述判定式本身不适用。数组头 8B 对齐即可满足 offset_table（u32）与元素区的对齐需求。元素区中每个子 struct 的 8B 落位由 4.4 的统一规则负责。
+> **non-uniform 数组为何不做 32B 对齐**：其元素是变长子对象，逐个通过 offset_table 定位后再按各自类型访问，**不存在整块 SIMD 消费**，对齐无收益；且 `sizeof(elem)` 对变长元素无定义，上述判定式本身不适用。数组头 8B 对齐即可满足 offset_table（u32）与元素区的对齐需求。元素区中每个子对象的落位由 4.4 的统一规则负责——若某元素本身是 uniform 大数组，它会在元素区内按 `32k+24` 落位，对齐链正常向下传递。
 
 数组头恰好占 8B（count 4B + type 2B + flags 2B），因此把**头**放在 `32k+24` 就能让**数据区**落在 32B 边界，且访问器偏移仍是常量 `+8`——**内部 padding 为 0**。
 
@@ -568,35 +571,35 @@ fn generateWriter(comptime T: type) type {
             try self.struct_buf.appendNTimes(0, L.header_and_body_size);
             // header_and_body_size = 8 + slot_count_fixed*8 + field_count_var*4
 
-            // ── 阶段 2a：HEADER（全部字段为 comptime 常量）──
+            // ── 阶段 2：HEADER（全部字段为 comptime 常量）──
             self.pokeHeader(struct_start, .{
                 .slot_count_fixed = L.slot_count_fixed,
                 .field_count_var  = L.field_count_var,
                 .schema_name_hash = L.schema_name_hash,
             });
 
-            // ── 阶段 2b：FIXED（定点回填，非 append）──
+            // ── 阶段 3：FIXED（定点回填，非 append）──
             inline for (L.fixed_fields) |fm| {
                 const v = @field(value, fm.name);
                 // 字符串字段：先 intern 拿到 string_off 再写槽
                 self.pokeSlot(struct_start + fm.slot_offset, fm, v);
             }
 
-            // ── 阶段 3：VARIABLE（append 数据 + 定点回填 VOT）──
+            // ── 阶段 4：VARIABLE（append 数据 + 定点回填 VOT）──
             inline for (L.variable_fields) |fm| {
                 const v = @field(value, fm.name);
                 if (fm.is_optional and v == null) {
                     self.pokeVot(struct_start, L.vot_start, fm.vot_index, 0xFFFF_FFFF);
                     continue;
                 }
-                // a. 按子对象对齐需求 append padding
-                //    ⚠ 判定基于 struct_buf 绝对偏移，不是相对 struct_start（见 4.4）
+                // 4a. 按子对象对齐需求 append padding
+                //     ⚠ 判定基于 struct_buf 绝对偏移，不是相对 struct_start（见 4.4）
                 try self.padTo(fm.childAlignSpec(v));
-                // b. 相对增量
+                // 4b. 相对增量
                 const rel_off = self.struct_buf.items.len - struct_start;
-                // c. 定点回填 VOT 槽
+                // 4c. 定点回填 VOT 槽
                 self.pokeVot(struct_start, L.vot_start, fm.vot_index, @intCast(rel_off));
-                // d. 递归序列化子对象（嵌套 struct 从阶段 1 重新开始）
+                // 4d. 递归序列化子对象（嵌套 struct 从阶段 1 重新开始）
                 try self.writeChild(v);
             }
             return struct_start;
@@ -628,7 +631,7 @@ fn generateWriter(comptime T: type) type {
               d. 递归序列化子对象（从步骤 1 重新开始）
 ```
 
-关键点：`struct_buf` 必须支持对**已 append 区域**的随机写（`ArrayList(u8).items[i]` 直接可写）。这不是"边算边填"的复杂 fixup 链，而是**预留 + 定点回填**，全程单次遍历，无二次扫描。`padTo` 承担步骤 4a，`pokeVot` 承担步骤 4c。数组的序列化同构：RESERVE 数组头 + offset_table → 写头（count/type/flags）→ 逐元素按 4.4 对齐落位并回填 offset_table 条目。
+关键点：`struct_buf` 必须支持对**已 append 区域**的随机写（`ArrayList(u8).items[i]` 直接可写）。这不是"边算边填"的复杂 fixup 链，而是**预留 + 定点回填**，全程单次遍历，无二次扫描。`padTo` 承担步骤 4a，`pokeVot` 承担步骤 4c。数组的序列化同构：RESERVE 数组头 + offset_table → 写头（count/type/flags）→ 逐元素按 4.4 对齐落位并回填 offset_table 条目；嵌套数组的元素本身就是一个数组，从阶段 1 递归即可。
 
 **Writer 写入顺序（两段式）**：最终 buffer 布局是 Header → String Pool → Root Struct，但字符串只有在遍历 struct 时才会被发现（Pool 无法先写完），因此 Writer 采用两段式构建：
 
@@ -957,7 +960,7 @@ z_lib/build.zig 添加构建步骤：
 | optional null 标记（u64/i64/f64） | 降级至 Variable 组，VOT = 0xFFFF_FFFF | bit 63 被值本身占满，无空余位，必须外置 null 标记 |
 | 可变字段导航 | Variable Offset Table (VOT) | O(1) 定位，VOT 本身 comptime 已知 |
 | 对齐判定基准 | struct_buf **绝对偏移**（VOT 只记相对增量） | 相对本 struct 头判定在嵌套场景下会失效（VOT 条目不保证是 32 的倍数） |
-| 数组格式 | uniform（标量/字符串）/ non-uniform（struct）路径 | uniform 路径支持直接 SIMD slice；字符串数组视作 4B 元素的 uniform 数组（pool 去重 ⟹ 比较 string_off 即可 SIMD 判等） |
+| 数组格式 | uniform（标量/字符串）/ non-uniform（变长子对象：struct 数组、嵌套数组）路径 | uniform 路径支持直接 SIMD slice；字符串数组视作 4B 元素的 uniform 数组（pool 去重 ⟹ 比较 string_off 即可 SIMD 判等）；non-uniform 元素为任意子对象，机制递归复用无特例 |
 | 数组数据区位置 | 恒定在数组头 +8（三条路径统一） | 访问器无分支、偏移为 comptime 常量 |
 | uniform 数组对齐 | 大数组头落在 32k+24（数据区 32B 对齐）；`count×sizeof < 32` 豁免为 8B | 消除 v0.4 头内固定 24B 浪费，开销降至 ≤31B/数组；小数组填不满向量，强制对齐反而拉长 cache line 距离 |
 | 访问器上下文 | View{buf, base, pool} 三字 | init 缓存 pool 基址，每次字符串访问省一次 header load |
@@ -1032,7 +1035,8 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 | v0.3.1 | 评审澄清（格式不变）：4.3 明确 pool_data 起点为 Pool 头 +8 并决策保留 string_count（仅 debug/校验）；4.4 显式声明 VOT 偏移基准为本 struct 头；optional sub-word 归入 Step 1 按声明顺序分配；full-width optional 数据块明确为动态分配（排除静态保留）；4.6 明确 uniform 数组 32B 对齐中 writer 的填充职责；6.3 补充 Writer 两段式写入顺序及组装时 root_off 的 32B 补齐 |
 | v0.4 | 评审修订：Struct Header 的 field_count_fixed 更名为 slot_count_fixed 并明确槽位语义（vot_start 公式仅槽位语义下成立）；4.6 新增 uniform string 路径（[][]const u8 = 4B string_off 元素的 uniform 数组）；4.4 新增 variable data 区对齐规则（子对象 8B 对齐落位，保证所有 struct base 为 8 的倍数）；6.3 伪代码重写为两段式模型；6.4 明确单一 pool 不变量；string_count 用途限定为 debug 构建校验与内省 |
 | v0.5 | **正确性修订**：① 修复嵌套 struct 内 uniform 数组的 32B 对齐失效 bug——对齐判定改为基于 struct_buf **绝对偏移**（VOT 仅记录相对增量），v0.4 的"相对本 struct 头对齐"在嵌套场景下不成立（VOT 条目只保证 8B）；② 4.4 Step 3 新增 optional 位编码规则，明确值须**零扩展**、**严禁符号扩展**（否则 `?i32 = -1` 会误置 bit 63 被读成 null）。**格式优化**：③ 数组数据区统一为数组头 +8（三条路径一致），大数组头改落在 `32k+24` 使数据区天然 32B 对齐，消除 v0.4 头内固定 24B 浪费（每数组开销 ≤55B → ≤31B），`count×sizeof < 32` 的小数组豁免为 8B 对齐；④ 访问器改为只声明元素自然对齐、不 `@alignCast(32)`，消除外语侧低对齐 UB 风险；flags bit1 记录对齐状态但仅供 debug。**表述收紧**：⑤ 合并 VOT `pad to 8B` 与子对象对齐为唯一一条规则（前者标注为派生结果）；⑥ 6.3 明确 Writer 的 reserve-then-backfill 阶段划分并重写伪代码；⑦ Swift/Kotlin 改为双构造器（public root 从 Header 读 root_off，internal 嵌套显式接收 poolData），修正 `base = 0` 与漏传 pool 两个 bug |
-| v0.5.1 | 评审补漏：① 4.4 对齐规则扩展为覆盖**所有子对象**（含 non-uniform 数组的元素区子 struct），以表格形式列出各类子对象的对齐需求；② 4.6 落位规则明确**仅 uniform 路径**适用 `32k+24`，non-uniform 一律 8B（元素逐个访问无整块 SIMD，且 `sizeof(elem)` 对变长 struct 无定义）；③ 6.3 三阶段补为**四阶段**，新增 HEADER 阶段（slot_count_fixed / field_count_var / schema_name_hash 此前无人写入），并补充数组序列化同构说明；④ 修正 4.5 注释——本例 `56` 同时满足 8B 与 `32k+24`，大小数组落点相同属巧合，非普遍规律；⑤ §12 问题 2 措辞更新（"string handle" → `string_off`，并补充 u64 偏移会使 `?string_off` 失去 bit 63 的连带影响）；⑥ 7.3 补 Kotlin `name` 访问器与 NUL 扫描成本说明，7.4 表同步细化 |
+| v0.5.1 | 评审补漏：① 4.4 对齐规则扩展为覆盖**所有子对象**（含 non-uniform 数组的元素区子 struct），以表格形式列出各类子对象的对齐需求；② 4.6 落位规则明确**仅 uniform 路径**适用 `32k+24`，non-uniform 一律 8B（元素逐个访问无整块 SIMD，且 `sizeof(elem)` 对变长元素无定义）；③ 6.3 三阶段补为**四阶段**，新增 HEADER 阶段（slot_count_fixed / field_count_var / schema_name_hash 此前无人写入），并补充数组序列化同构说明；④ 修正 4.5 注释——本例 `56` 同时满足 8B 与 `32k+24`，大小数组落点相同属巧合，非普遍规律；⑤ §12 问题 2 措辞更新（"string handle" → `string_off`，并补充 u64 偏移会使 `?string_off` 失去 bit 63 的连带影响）；⑥ 7.3 补 Kotlin `name` 访问器与 NUL 扫描成本说明，7.4 表同步细化 |
+| v0.5.2 | 措辞补全（格式不变）：① 4.4 表格与 4.6 non-uniform 路径的"子 struct"放宽为"变长子对象（子 struct **或嵌套 array**）"，显式覆盖 `[][]f32` / `[][]Address`——机制原本已支持（元素即任意子对象，落位规则递归复用），仅措辞收窄；补充嵌套 array 元素本身若是 uniform 大数组仍按 `32k+24` 落位、对齐链正常向下传递；② 6.3 统一阶段编号（代码注释的 2a/2b 改为与正文一致的 2 HEADER / 3 FIXED / 4 VARIABLE，子步骤记为 4a–4d） |
 
 ---
 
