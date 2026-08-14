@@ -1,7 +1,7 @@
 # ZigPack：零拷贝跨语言二进制序列化格式
 
 > **状态**：设计草稿，待技术评审
-> **版本**：v0.2（根据评审反馈修订：optional 编码、slot 打包规则、struct_id、演化边界）
+> **版本**：v0.3（性能修订：字符串去间接层、槽序声明顺序、View 缓存 pool 基址、uniform 数组 32B 对齐）
 > **作者**：待填写
 > **日期**：2026-08-14
 
@@ -137,17 +137,19 @@ Offset  大小  字段             说明
 Offset  大小                内容
 ──────  ──────────────────  ──────────────────────────────────
 0       4B                  pool_byte_len（字符串数据区总字节数）
-4       4B                  string_count
-8       string_count × 4B   index[]：每个字符串相对 pool_data 起点的偏移（u32）
-?       (pad to 8B)
-?       pool_byte_len B      pool_data[]：紧密排列的 NUL 结尾 UTF-8 字符串
+4       4B                  string_count（仅 debug / 内省用）
+8       pool_byte_len B     pool_data[]：紧密排列的 NUL 结尾 UTF-8 字符串
 ```
 
-**字符串句柄（string_handle）**：值槽中存储的是 `index[]` 数组的下标（u32），而非原始字节偏移。访问路径为两次 load：
+**字符串偏移（string_off）**：值槽中**直接**存储该字符串在 `pool_data` 内的字节偏移（u32），没有中间索引层。访问路径为一次 load：
 
 ```
-string_handle → index[string_handle] → pool_data[index[string_handle]]
+string_off → pool_data[string_off]   （pool_data 基址由 View.init 缓存，见 6.4）
 ```
+
+写入端 `StringInterner` 按插入顺序向 pool_data 追加字符串，偏移在插入时即确定（= 追加前的 pool_data 长度），因此写入值槽的偏移就是最终偏移，**无需序列化收尾 fixup**。
+
+> v0.1–v0.2 曾使用 handle → index[] → pool_data 两级间接。该间接层在读取端零收益（去重发生在写入端），却使每次字符串访问多一次依赖 load，且 index[] 每字符串多耗 4B。v0.3 移除。
 
 ---
 
@@ -178,11 +180,12 @@ Offset  大小                        内容
 
 ```
 可进入 Fixed 组的字段类型：
-  u64、i64、f64                   → 每字段独占一个 8B 槽
-  u32、i32、f32、string_handle    → 每字段独占一个 8B 槽（低4B存值，高4B=0）
-  u16、i16、u8、i8、bool          → sub-word 类型，若干个共享一个 8B 槽（见下文）
-  ?u32、?i32、?f32、?string_handle、?u16、?i16、?u8、?i8、?bool
-                                  → optional 的 non-full-width 类型，独占一个 8B 槽
+  u64、i64、f64                          → 每字段独占一个 8B 槽
+  u32、i32、f32、string_off              → 每字段独占一个 8B 槽（低4B存值，高4B=0）
+  u16、i16、u8、i8、bool（非 optional）  → sub-word 类型，若干个共享一个 8B 槽（见 Step 2）
+  ?u32、?i32、?f32、?string_off、?u16、?i16、?u8、?i8、?bool
+                                         → optional 的 non-full-width 类型，
+                                           独占一个 8B 槽（bit 63 做 null 标记，见 Step 3）
 
 禁止进入 Fixed 组（必须进入 Variable 组）：
   ?u64、?i64、?f64                → full-width optional，8B 槽内无空余位置存 null 标记
@@ -204,24 +207,20 @@ Offset  大小                        内容
 
 Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时无开销**：
 
-**Step 1：独占槽字段排序**
+**Step 1：独占槽字段分配（保持声明顺序）**
 
-将独占 8B 槽的字段（`u64/i64/f64` 及各 32 位类型及其 optional）按原生对齐降序排列：
+独占槽字段（`u64/i64/f64`、`u32/i32/f32/string_off` 及全部 non-full-width optional）按**声明顺序**依次分配 8B 槽，低位存值，高位补零。
 
-```
-u64/i64/f64（8B 对齐）
-u32/i32/f32/string_handle 及其 optional（4B 对齐）
-```
+理由：8B 等步长槽位下所有槽自然 8B 对齐，按类型大小排序没有任何对齐收益；保持声明顺序把 cache-line 局部性的控制权交给 schema 作者——高频字段排在前面即可挤进同一条 cache line（64B = 8 个槽），这是本设计缓存友好性的直接控制点。
 
-每个字段按序分配一个完整 8B 槽，低位存值，高位补零。
+**Step 2：sub-word 字段打包（仅非 optional）**
 
-**Step 2：sub-word 字段打包**
-
-所有 `u16/i16/u8/i8/bool` 及其 optional 字段，在独占槽字段之后，按原始定义顺序**贪心装箱**进 8B 槽：
+所有**非 optional** 的 `u16/i16/u8/i8/bool` 字段，在独占槽字段之后，按声明顺序**贪心装箱**进 8B 槽：
 
 - 每个槽可容纳的字节位置：`byte 0..7`（共 8 字节）
 - 按 **对齐边界** 将字段放入当前槽：u16 放 2B 对齐位置，u8/bool 放任意字节位置
 - 当前槽装不下时，开启新槽
+- **optional sub-word 字段不参与装箱**，一律独占 8B 槽、bit 63 做 null 标记（见 Step 3）——同一槽内多个 optional 无法共用 bit 63，必须独占
 - 每个字段的字节偏移（相对所在槽起点）由 comptime 计算并记录在 FieldMeta 中
 
 **Step 3：optional null 标记**
@@ -263,7 +262,7 @@ Schema 定义：
 const Person = struct {
     id:      u64,          // u64，独占槽
     score:   f32,          // f32，独占槽
-    name:    []const u8,   // string，独占槽（string_handle = u32）
+    name:    []const u8,   // string，独占槽（string_off = u32，直接 pool 偏移）
     age:     u8,           // sub-word
     active:  bool,         // sub-word
     tags:    [][]const u8, // variable
@@ -275,12 +274,12 @@ const Person = struct {
 **comptime 分组结果**：
 
 ```
-独占槽（Step 1，对齐降序）：
+独占槽（Step 1，声明顺序）：
   id      → u64，槽 0
   score   → f32，槽 1（低4B，高4B=0）
-  name    → string_handle u32，槽 2（低4B，高4B=0）
+  name    → string_off u32，槽 2（低4B，高4B=0）
 
-sub-word 打包（Step 2，贪心装箱）：
+sub-word 打包（Step 2，贪心装箱，仅非 optional）：
   age(u8) + active(bool) → 槽 3 的 byte0 + byte1，其余补零
 
 Variable 组（VOT）：
@@ -297,7 +296,7 @@ Offset  大小   内容
 0       8B     Struct Header（field_count_fixed=4, field_count_var=3, schema_name_hash）
 8       8B     Fixed 槽 0：id（u64，8B）
 16      8B     Fixed 槽 1：score（f32，低4B；高4B = 0）
-24      8B     Fixed 槽 2：name（string_handle u32，低4B；高4B = 0）
+24      8B     Fixed 槽 2：name（string_off u32，低4B；高4B = 0）
 32      8B     Fixed 槽 3：[byte0=age][byte1=active][byte2-7=0]
 40      4B     VOT[0]：tags 相对本 struct 头的偏移
 44      4B     VOT[1]：address 相对本 struct 头的偏移
@@ -320,15 +319,18 @@ active = *(u8*)(buf + struct_base + 32 + 1) != 0
 // person.score — 单条 load
 score = *(f32*)(buf + struct_base + 16)
 
+// person.name — 一次 load 得到 pool 偏移（pool_data 基址由 View 缓存）
+str_ptr = pool_data + *(u32*)(buf + struct_base + 24)
+
 // person.uid（?u64）— 读 VOT，判空，再读值
 uid_vot = *(u32*)(buf + struct_base + 48)
 if uid_vot == 0xFFFF_FFFF → null
 else → *(u64*)(buf + struct_base + uid_vot)
 
-// person.address.street — 两级 VOT + 固定槽
-addr_off      = *(u32*)(buf + struct_base + 44)
-street_handle = *(u32*)(buf + struct_base + addr_off + STREET_SLOT_OFFSET)
-str_ptr       = pool_data + index[street_handle]
+// person.address.street — VOT + 固定槽 + 一次 load
+addr_off   = *(u32*)(buf + struct_base + 44)
+street_off = *(u32*)(buf + struct_base + addr_off + STREET_SLOT_OFFSET)
+str_ptr    = pool_data + street_off
 ```
 
 全程无分配，无哈希查找，无类型断言。所有偏移均为 comptime 常量。
@@ -345,12 +347,15 @@ Offset  大小                内容
 6       2B                  flags: u16（bit0: uniform）
 
 [uniform scalar path，如 []f32、[]i64]
-8       element_count × sizeof(T)   紧密排列的原始数据
+8       24B padding                数据区固定起始于数组头 +32（见下）
+32      element_count × sizeof(T)  紧密排列的原始数据（32B 对齐）
 
 [non-uniform / struct array path]
 8       element_count × 4B          offset_table[]（各元素相对数组头偏移）
 ?       element data[]              各元素 inline struct 数据
 ```
+
+**uniform 数组的 32B 对齐**：writer 将 uniform 数组头放置在 32B 相对对齐的位置（buffer 基地址的 32B 对齐由 allocator 保证，见 8），数据区固定从数组头 +32 开始——偏移是常量，访问器无需运行时计算；SIMD 循环可使用 aligned load，无 cache-line split。代价是每个 uniform 数组固定 24B padding（性能优先于体积的取舍）。
 
 **uniform 标志的意义**：标记为 uniform 的数组，其数据区是一段连续的同类型标量，访问器直接返回对应 Zig/C/Swift slice，调用方可以直接 SIMD 处理，无任何 per-element 开销。
 
@@ -380,7 +385,7 @@ TYPE_TAG 值定义：
 0x14..0x17  UInt 系列
 0x20  Float32（payload = f32 bits）
 0x21  Float64（下一个 8B 存 f64 值，共 16B）
-0x30  String（payload = pool_handle u32）
+0x30  String（payload = pool_data 内偏移 u32）
 0x40  Array（payload = 相对 tape 起点的偏移）
 0x50  Object（payload = 相对 tape 起点的偏移）
 ```
@@ -425,8 +430,8 @@ fn computeLayout(comptime T: type) LayoutMeta {
     comptime {
         const fields = std.meta.fields(T);  // comptime-only 操作
 
-        // 1. 分组：fixed（标量 + string_handle）vs variable（slice、嵌套 struct）
-        // 2. fixed 组：按对齐大小降序排列，计算 byte_offset（步长固定 8B）
+        // 1. 分组：fixed（标量 + string_off）vs variable（slice、嵌套 struct）
+        // 2. fixed 组：独占槽字段按声明顺序分配 8B 槽；sub-word 字段贪心装箱
         // 3. variable 组：按定义顺序分配 vot_index
         // 4. 计算 vot_start_offset = 8 + field_count_fixed * 8
         // 5. 返回 []FieldMeta（comptime 常量数组）
@@ -443,7 +448,8 @@ fn generateWriter(comptime T: type) type {
     const Layout = computeLayout(T);
     return struct {
         buf:          std.ArrayList(u8),
-        string_pool:  StringInterner,   // 写入时对字符串去重
+        string_pool:  StringInterner,   // 写入时对字符串去重；intern() 返回该字符串
+                                       // 在 pool_data 中的最终偏移（插入时确定，无需 fixup）
 
         pub fn write(self: *@This(), value: T) ![]const u8 {
             // comptime inline for：编译器为每个字段展开代码，无循环
@@ -472,15 +478,19 @@ fn generateView(comptime T: type) type {
     return struct {
         buf:  [*]const u8,   // 裸指针，不拥有数据
         base: u32,           // 本 struct 在 buffer 中的起点偏移
+        pool: u32,           // pool_data 基址偏移（init 时从 header 读取一次并缓存）
 
         // comptime 为每个 fixed 字段生成一个访问函数
         // 例如 id() → @as(u64, @bitCast(buf[base + 8 ..][0..8].*))
         // 编译为：mov rax, [rdi + base_const + 8]  （单条指令）
 
+        // 字符串字段：1 次 load 得到 pool 偏移，pool 基址已缓存，无拷贝
+        // pub fn name(self: @This()) []const u8 { ... }
+
         // 嵌套 struct：返回子 View，2 条 load，无拷贝
         pub fn address(self: @This()) generateView(Address) {
             const child_off = readU32(self.buf, self.base + Layout.vot_start + 4 * 1);
-            return generateView(Address){ .buf = self.buf, .base = self.base + child_off };
+            return generateView(Address){ .buf = self.buf, .base = self.base + child_off, .pool = self.pool };
         }
 
         // Uniform array：返回 []const f32 slice，调用方直接 SIMD 处理
@@ -488,13 +498,14 @@ fn generateView(comptime T: type) type {
             const arr_off = readU32(self.buf, self.base + Layout.vot_start + 4 * 0);
             const arr_ptr = self.buf + self.base + arr_off;
             const count   = readU32(arr_ptr, 0);
-            return @as([*]const f32, @ptrCast(@alignCast(arr_ptr + 8)))[0..count];
+            // 数据区固定位于数组头 +32（32B 对齐，见 4.6）
+            return @as([*]const f32, @ptrCast(@alignCast(arr_ptr + 32)))[0..count];
         }
     };
 }
 ```
 
-View 类型仅包含两个字段（指针 + 偏移），按值传递开销极低。
+View 类型仅包含三个字段（指针 + struct 偏移 + pool 基址），按值传递开销极低；缓存 pool 基址使每次字符串访问省去一次 header load。
 
 ---
 
@@ -508,7 +519,7 @@ Zig 构建步骤（b.addRunArtifact）
   输出：PersonView.swift、PersonView.kt、PersonView.ts
 
 SchemaDescriptor 内容：
-  type_name、struct_id、field_count_fixed、vot_start
+  type_name、schema_name_hash、field_count_fixed、vot_start
   每个字段：name、type_tag、byte_offset 或 vot_index、nullable
 ```
 
@@ -516,17 +527,20 @@ SchemaDescriptor 内容：
 
 ```swift
 // AUTO-GENERATED — do not edit
-// Source schema: Person (struct_id: 0xA3F1)
+// Source schema: Person (schema_name_hash: 0x9C3F1A2B)
 
 import Foundation
 
 public struct PersonView {
     private let buf: UnsafeRawBufferPointer
     private let base: Int
+    private let poolData: Int   // pool_data 基址，init 时算好并缓存
 
     public init(_ buffer: UnsafeRawBufferPointer, base: Int = 0) {
         self.buf = buffer
         self.base = base
+        let poolOff = Int(buffer.load(fromByteOffset: 8, as: UInt32.self))
+        self.poolData = poolOff + 8
     }
 
     // Fixed field: id (u64) at base+8
@@ -540,21 +554,15 @@ public struct PersonView {
         buf.load(fromByteOffset: base + 32, as: UInt8.self)
     }
 
-    // Fixed field: score (optional f32) at base+16
-    public var score: Float? {
-        let slot = buf.load(fromByteOffset: base + 16, as: UInt64.self)
-        guard slot & 0x8000_0000_0000_0000 == 0 else { return nil }
-        return Float(bitPattern: UInt32(slot & 0xFFFF_FFFF))
+    // Fixed field: score (f32) at base+16
+    public var score: Float {
+        Float(bitPattern: buf.load(fromByteOffset: base + 16, as: UInt32.self))
     }
 
-    // Fixed field: name (string) at base+24
+    // Fixed field: name (string) at base+24 — 一次 load + 一次拷贝
     public var name: String {
-        let handle   = buf.load(fromByteOffset: base + 24, as: UInt32.self)
-        let poolBase = Int(buf.load(fromByteOffset: 8, as: UInt32.self))
-        let strOff   = buf.load(fromByteOffset: poolBase + 8 + Int(handle) * 4, as: UInt32.self)
-        // indexSectionSize 由 codegen 根据 string_count 填入
-        let dataBase = poolBase + 8 + INDEX_SECTION_SIZE + Int(strOff)
-        return String(cString: buf.baseAddress!.advanced(by: dataBase))
+        let strOff = buf.load(fromByteOffset: base + 24, as: UInt32.self)
+        return String(cString: buf.baseAddress!.advanced(by: poolData + Int(strOff)))
         // 注：String(cString:) 在此处发生一次拷贝（Swift 内存安全要求）
     }
 
@@ -563,6 +571,15 @@ public struct PersonView {
         let childOff = buf.load(fromByteOffset: base + VOT_START + 4, as: UInt32.self)
         return AddressView(buf, base: base + Int(childOff))
     }
+
+    // Variable field: uid (optional u64) — VOT index 2，0xFFFF_FFFF = null
+    public var uid: UInt64? {
+        let off = buf.load(fromByteOffset: base + VOT_START + 8, as: UInt32.self)
+        guard off != 0xFFFF_FFFF else { return nil }
+        return buf.load(fromByteOffset: base + Int(off), as: UInt64.self)
+    }
+
+    private static let VOT_START = 40  // 由 codegen 填入
 }
 ```
 
@@ -572,24 +589,33 @@ public struct PersonView {
 
 ```kotlin
 // AUTO-GENERATED — do not edit
-// Source schema: Person (struct_id: 0xA3F1)
+// Source schema: Person (schema_name_hash: 0x9C3F1A2B)
 
 class PersonView(private val buf: java.nio.ByteBuffer, private val base: Int = 0) {
 
-    init { buf.order(java.nio.ByteOrder.LITTLE_ENDIAN) }
+    // pool_data 基址，构造时算好并缓存
+    private val poolData: Int
+
+    init {
+        buf.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        poolData = buf.getInt(8) + 8
+    }
 
     // Fixed field: id (u64) at base+8
     val id: Long get() = buf.getLong(base + 8)
     // JIT 内联后等价于单条 native load 指令
 
     // Fixed field: age (u8) at base+32
-    val age: Short get() = (buf.get(base + 32).toInt() and 0xFF).toShort()
+    val age: Int get() = buf.get(base + 32).toInt() and 0xFF
 
-    // Fixed field: score (optional f32) at base+16
-    val score: Float? get() {
-        val slot = buf.getLong(base + 16)
-        if (slot and Long.MIN_VALUE != 0L) return null
-        return java.lang.Float.intBitsToFloat((slot and 0xFFFFFFFFL).toInt())
+    // Fixed field: score (f32) at base+16
+    val score: Float get() = java.lang.Float.intBitsToFloat(buf.getInt(base + 16))
+
+    // Variable field: uid (optional u64) — VOT index 2，0xFFFF_FFFF = null
+    val uid: Long? get() {
+        val off = buf.getInt(base + VOT_START + 8)
+        if (off == -1) return null   // 0xFFFF_FFFF
+        return buf.getLong(base + off)
     }
 
     // Variable field: address — VOT index 1
@@ -610,9 +636,9 @@ class PersonView(private val buf: java.nio.ByteBuffer, private val base: Int = 0
 ```
 语言        标量字段          字符串字段              嵌套 struct
 ────────    ─────────────     ────────────────────    ─────────────────
-Zig         1 load            2 load（无拷贝）         2 load + 子base
-Swift       1 load            ~4 load + 1 copy        3 load
-Kotlin      1 JIT load        ~6 load + 1 copy        3 JIT load + 1 alloc
+Zig         1 load            1 load（无拷贝）         2 load + 子base
+Swift       1 load            1 load + 1 copy         2 load
+Kotlin      1 JIT load        1 JIT load + 1 copy     2 JIT load + 1 alloc
 TypeScript  DataView.getXxx   TextDecoder + copy      递归调用
 ```
 
@@ -649,7 +675,8 @@ const arr = view.scores();
 var sum: f32 = 0;
 for (arr) |v| sum += v;
 // LLVM 自动生成 AVX2 VADDPS（每次处理 8 个 f32）
-// 前提：buffer 基地址至少 8B 对齐（设计保证），最优需 32B 对齐
+// 前提：buffer 基地址 32B 对齐（allocator 硬性保证），
+//       uniform 数组数据区 32B 相对对齐（见 4.6），可用 aligned load
 ```
 
 ### 8.3 读取时：动态对象字段查找
@@ -662,9 +689,9 @@ for (arr) |v| sum += v;
 
 ### 对齐要求
 
-- Buffer allocator 需提供至少 **8B 对齐**（保证所有字段自然对齐）
-- 存储大型 float array 时推荐 **32B 对齐**（满足 AVX2 aligned load）
-- Array 头部（8B）后 element 数据自动 8B 对齐，满足 SSE2 要求
+- Buffer allocator 统一保证 **32B 对齐**（v0.3 起为硬性要求）：这是 uniform 数组数据区 32B 相对对齐的前提，同时覆盖所有字段的自然对齐需求
+- Uniform 数组数据区固定从数组头 +32 开始（见 4.6），SIMD 循环无 cache-line split
+- 若外语侧 FFI 只能保证 8B 对齐（如 JVM direct ByteBuffer），uniform 数组退化为 unaligned load（现代 CPU 上惩罚很小），标量路径不受影响
 
 ---
 
@@ -714,14 +741,16 @@ z_lib/build.zig 添加构建步骤：
 | 决策 | 选择 | 理由 |
 |---|---|---|
 | 偏移方式 | 纯相对偏移（u32） | Position-independent，可 mmap / 落盘 / 跨进程 |
-| 字符串存储 | 集中 String Pool + u32 handle | 去重、NUL 结尾与 C FFI 兼容、handle 尺寸小 |
-| 固定字段布局 | comptime 计算偏移，8B 等步长槽 | O(1) 单 load 访问，LLVM 折叠偏移计算 |
+| 字符串存储 | 集中 String Pool + u32 直接偏移 | 去重、NUL 结尾与 C FFI 兼容、单次 load 访问（无 index 间接层，v0.3 移除） |
+| 固定字段布局 | comptime 计算偏移，8B 等步长槽，保持声明顺序 | O(1) 单 load；声明顺序让 schema 作者控制 cache line 局部性（8B 等步长下按大小排序无对齐收益） |
 | sub-word 打包 | 贪心装箱进 8B 槽，按对齐边界排列 | 节省空间的同时保持 comptime 可计算的确定性偏移 |
 | optional null 标记（≤32 位类型） | bit 63 of 8B slot | 无额外 bitmap，单次 AND+branch，不影响值精度 |
 | optional null 标记（u64/i64/f64） | 降级至 Variable 组，VOT = 0xFFFF_FFFF | bit 63 被值本身占满，无空余位，必须外置 null 标记 |
-| struct_id | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
+| schema_name_hash | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
 | 可变字段导航 | Variable Offset Table (VOT) | O(1) 定位，VOT 本身 comptime 已知 |
 | 数组格式 | uniform/non-uniform 双路径 | uniform 路径支持直接 SIMD slice |
+| uniform 数组对齐 | 数据区固定 32B 对齐（数组头 +32） | SIMD aligned load 无 cache-line split；代价 ≤24B/数组 padding（性能优先于体积） |
+| 访问器上下文 | View{buf, base, pool} 三字 | init 缓存 pool 基址，每次字符串访问省一次 header load |
 | 动态类型 | 可选 ZValue tape | 仅在需要动态 JSON-like 数据时引入，主路径无开销 |
 | **Schema 演化** | **v1 不支持（有意识取舍）** | **见下文说明** |
 | Schema 定义 | Zig 原生 struct + comptime | 无 IDL 文件，类型系统统一，无阻抗失配 |
@@ -772,7 +801,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 
 4. **String Pool 构建的内存使用**：序列化时 StringInterner 需要临时哈希表存储所有已见字符串。对于大量小对象的批量序列化，此哈希表的内存峰值是否可接受？是否需要提供"禁用去重"的快速路径选项？
 
-5. **对齐保证与外语传递**：buffer allocator 需提供至少 8B 对齐（最优 32B）。通过 FFI 传递给外语时，需外语侧保证不把 buffer 内容复制到不对齐的内存中（如 JVM byte[] 不保证 8B 对齐，使用 direct ByteBuffer 可保证）。此约束是否可接受？
+5. **对齐保证与外语传递**：v0.3 起 allocator 需保证 **32B 对齐**（硬性要求）。通过 FFI 传递给外语时，需外语侧不把 buffer 复制到低对齐内存（JVM direct ByteBuffer 通常只保证 8/16B；Swift 手动分配可达 32B）。若外语侧只能保证 8B，uniform 数组 SIMD 退化为 unaligned load（现代 CPU 惩罚很小），标量路径不受影响。此降级策略是否可接受？
 
 6. **TypeScript 路径**：`DataView` 的字段访问开销比原生高约 3-5 倍。是否考虑提供 WASM 桥接选项（由 Zig 编译到 WASM，通过 `wasm-bindgen` 风格 glue 暴露给 JS），以在 TS 侧获得接近原生的性能？
 
@@ -786,6 +815,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 |---|---|
 | v0.1 | 初稿 |
 | v0.2 | 修正 optional u64/f64 编码（降级至 Variable 组）；统一 sub-word 字段打包规则为贪心装箱；struct_id 从 u16 改为 u32 FNV-32a 并明确仅供 debug；明确 schema 演化为有意识的 v1 边界；更新 4.5 示例使其与规则一致 |
+| v0.3 | 性能修订（原则：性能 > 体积）：字符串去 index 间接层（值槽直接存 pool 偏移，访问 2 load → 1 load，省 index[] 区）；fixed 槽保持声明顺序（作者控制 cache line 局部性，替代按大小排序）；View 增加缓存 pool 基址；uniform 数组数据区固定 32B 对齐（数组头 +32，allocator 硬性 32B 对齐）；sub-word optional 明确独占槽（消除 Step 2 与 Step 3 的矛盾）；Swift/Kotlin 示例与 4.5 对齐（score 非 optional、age 返回类型、补 uid 访问器） |
 
 ---
 
