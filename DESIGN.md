@@ -159,39 +159,99 @@ Offset  大小                        内容
 0       8B                          Struct Header
                                       field_count_fixed: u16
                                       field_count_var:   u16
-                                      struct_id:         u16（type name 哈希）
-                                      reserved:          u16 = 0
+                                      schema_name_hash:  u32（fnv32a，debug 用）
 8       field_count_fixed × 8B      Fixed Section（固定字段槽位区）
 ?       field_count_var × 4B        Variable Offset Table（VOT）
 ?       (pad to 8B)
 ?       variable data               内联的嵌套 struct / array 数据
 ```
 
-**字段分组与排序规则**（comptime 自动执行）：
+> **关于 `schema_name_hash`**：从 16 位改为 32 位（FNV-32a of type name），仅用于 debug / 运行时 assert，**不作为安全校验**（碰撞概率 ~1/4B，校验严格性不足；如需严格校验应比较完整 type name 字符串）。32 位相比 16 位碰撞概率下降 65536 倍，误报率在调试场景可接受。
+
+---
+
+#### 字段分组规则（comptime 自动执行）
+
+字段被分为两组：
+
+**Fixed 组**（每个字段或每个打包槽占 8B）：
 
 ```
-Fixed 组（每字段 8B 槽）：
-  u64 / f64 / i64           → 优先排列（对齐最高）
-  u32 / f32 / i32
-  u16 / i16
-  u8 / bool / string_handle（u32）
+可进入 Fixed 组的字段类型：
+  u64、i64、f64                   → 每字段独占一个 8B 槽
+  u32、i32、f32、string_handle    → 每字段独占一个 8B 槽（低4B存值，高4B=0）
+  u16、i16、u8、i8、bool          → sub-word 类型，若干个共享一个 8B 槽（见下文）
+  ?u32、?i32、?f32、?string_handle、?u16、?i16、?u8、?i8、?bool
+                                  → optional 的 non-full-width 类型，独占一个 8B 槽
 
-Variable 组（每字段在 VOT 中占 4B 偏移量）：
-  嵌套 struct、array、optional complex
-  保持 schema 定义中的顺序
+禁止进入 Fixed 组（必须进入 Variable 组）：
+  ?u64、?i64、?f64                → full-width optional，8B 槽内无空余位置存 null 标记
+  []T（任意 slice）               → 可变长度
+  T（嵌套 struct）                → 可变长度
 ```
 
-**固定槽位（8B）编码规则**：
+**Variable 组**（每字段在 VOT 中占一个 4B 相对偏移，`0xFFFF_FFFF` = null）：
 
-| 类型 | 编码方式 |
-|---|---|
-| 整数 / 浮点 | 低位对齐，高位补零 |
-| bool | 0 或 1，占满 8B |
-| string_handle | u32 存低 4B，高 4B = 0 |
-| optional（nullable） | bit 63 = 1 表示 null，其余位存实际值 |
-| 连续 >4 个 bool 字段 | 打包为单个 8B 位域槽，访问器生成位提取代码 |
+```
+嵌套 struct（包括 ?T 形式的 optional 嵌套 struct）
+[]T（slice / array）
+?u64、?i64、?f64（因 null 标记问题降级至此）
+```
 
-使用 8B 统一步长的理由：等步长使 CPU prefetcher 可预测地预取下一个字段；字段索引计算退化为乘法加常量偏移，可被 LLVM 折叠为单条指令。
+---
+
+#### Fixed 组内的槽位分配规则
+
+Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时无开销**：
+
+**Step 1：独占槽字段排序**
+
+将独占 8B 槽的字段（`u64/i64/f64` 及各 32 位类型及其 optional）按原生对齐降序排列：
+
+```
+u64/i64/f64（8B 对齐）
+u32/i32/f32/string_handle 及其 optional（4B 对齐）
+```
+
+每个字段按序分配一个完整 8B 槽，低位存值，高位补零。
+
+**Step 2：sub-word 字段打包**
+
+所有 `u16/i16/u8/i8/bool` 及其 optional 字段，在独占槽字段之后，按原始定义顺序**贪心装箱**进 8B 槽：
+
+- 每个槽可容纳的字节位置：`byte 0..7`（共 8 字节）
+- 按 **对齐边界** 将字段放入当前槽：u16 放 2B 对齐位置，u8/bool 放任意字节位置
+- 当前槽装不下时，开启新槽
+- 每个字段的字节偏移（相对所在槽起点）由 comptime 计算并记录在 FieldMeta 中
+
+**Step 3：optional null 标记**
+
+- non-full-width optional（`?u32`、`?u16`、`?u8`、`?bool` 等）：**bit 63 = 1** 表示 null，其余位存实际值。此方案对这些类型安全，因为：
+  - `?u32`：低 32 位存值，bit 63 为 null 标记，中间 31 位置零，无冲突
+  - `?u16/u8/bool`：值更小，高位空间更充裕
+- full-width optional（`?u64`、`?i64`、`?f64`）：**降级至 Variable 组**，VOT 条目 = `0xFFFF_FFFF` 表示 null，有值时指向一个内联的 8B 数据块
+
+---
+
+#### sub-word 打包示例
+
+Schema 片段：`active: bool, age: u8, score_int: u16, code: u8`
+
+comptime 装箱过程：
+
+```
+槽 N（8B）:
+  byte 0: active（bool，1B）
+  byte 1: age（u8，1B）
+  byte 2-3: score_int（u16，2B 对齐，放 byte2）
+  byte 4: code（u8，1B）
+  byte 5-7: 补零
+```
+
+访问 `age`：`*(u8*)(buf + struct_base + slot_N_offset + 1)` — 单条 load。
+访问 `score_int`：`*(u16*)(buf + struct_base + slot_N_offset + 2)` — 单条 load。
+
+所有字节偏移均为 comptime 常量，codegen 直接将偏移硬编码进访问器。
 
 ---
 
