@@ -1,0 +1,680 @@
+# ZigPack：零拷贝跨语言二进制序列化格式
+
+> **状态**：设计草稿，待技术评审
+> **版本**：v0.1
+> **作者**：待填写
+> **日期**：2026-08-14
+
+---
+
+## 目录
+
+1. [背景与目标](#1-背景与目标)
+2. [核心约束](#2-核心约束)
+3. [整体架构](#3-整体架构)
+4. [二进制格式规范](#4-二进制格式规范)
+5. [值编码策略](#5-值编码策略)
+6. [Zig comptime 代码生成](#6-zig-comptime-代码生成)
+7. [跨语言访问器生成](#7-跨语言访问器生成)
+8. [SIMD 优化策略](#8-simd-优化策略)
+9. [模块结构](#9-模块结构)
+10. [设计决策汇总](#10-设计决策汇总)
+11. [与同类方案对比](#11-与同类方案对比)
+12. [待评审问题](#12-待评审问题)
+
+---
+
+## 1. 背景与目标
+
+### 问题
+
+现有跨语言数据交换方案存在性能或易用性权衡：
+
+| 方案 | 问题 |
+|---|---|
+| JSON（文本） | 解析慢，内存占用大，数值精度损失 |
+| Protobuf / MessagePack | 需要完整反序列化拷贝，访问前必须解码 |
+| FlatBuffers | 格式复杂，IDL 独立维护，与语言生态割裂 |
+| 共享内存（手写） | 每次都要重新定义布局，缺乏类型安全 |
+
+### 目标
+
+设计一个名为 **ZigPack** 的底层库，实现：
+
+1. **零拷贝读取**：数据序列化后直接通过指针传递，无需反序列化
+2. **跨语言 FFI**：Zig、Swift、Kotlin、TypeScript 通过生成的访问器直接读取同一块内存
+3. **类型安全**：Schema 在 Zig 原生 struct 中定义，各语言访问器由编译期自动生成
+4. **高性能**：充分利用 CPU 缓存友好布局与自动 SIMD 向量化
+5. **JSON 兼容类型系统**：支持 null、bool、int、float、string、array、object/map
+
+---
+
+## 2. 核心约束
+
+- **不可变数据**：序列化后的 buffer 为只读，不支持原地修改
+- **最多一次拷贝**：buffer 从 Zig 传递给其他语言运行时时允许最多一次内存拷贝，之后只读
+- **纯相对偏移**：buffer 内部不含任何绝对指针，可 mmap、可落盘、可网络传输
+- **Schema 驱动**：主路径（schema-typed）的所有字段偏移在编译期确定，无运行时查找开销
+- **可选动态路径**：提供类 JSON 的动态类型（ZValue tape），用于非 schema 场景
+
+---
+
+## 3. 整体架构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       开发时（构建期）                        │
+│                                                              │
+│  Person struct (Zig)                                         │
+│       │                                                      │
+│       ▼ std.meta.fields() — comptime                         │
+│  LayoutMeta（字段分组、偏移计算、VOT 索引）                  │
+│       │                                                      │
+│       ├──▶ Writer（序列化器，comptime 生成）                 │
+│       ├──▶ View（零拷贝访问器，comptime 生成）               │
+│       └──▶ SchemaDescriptor（构建产物）                      │
+│                │                                             │
+│                ▼ codegen 构建步骤（Zig 可执行文件）           │
+│           PersonView.swift / PersonView.kt                   │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│                         运行时                               │
+│                                                              │
+│  writer.write(person) ──▶ []const u8 buffer                  │
+│                                                              │
+│  ┌── FFI ──────────────────────────────────────────────┐    │
+│  │  传递：(ptr: *anyopaque, len: usize)  ← 唯一允许的拷贝 │   │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Zig View.init(buf)    ──▶ view.id()      单条 load 指令     │
+│  Swift PersonView(buf) ──▶ view.id        单条 load 指令     │
+│  Kotlin PersonView(buf)──▶ view.id        JIT inline load    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 二进制格式规范
+
+### 4.1 Buffer 总体结构
+
+```
+Offset  大小   内容
+──────  ─────  ──────────────────────────────────────
+0       16B    Buffer Header（固定，位置无关的元数据）
+16      var    String Pool（8B 对齐）
+?       var    Root Struct 或 ZValue Tape（8B 对齐）
+```
+
+所有偏移均为相对于 `buf[0]` 的字节偏移量（u32，最大支持 4GiB buffer）。
+
+---
+
+### 4.2 Buffer Header（16 字节）
+
+```
+Offset  大小  字段             说明
+──────  ────  ──────────────   ───────────────────────────────
+0       4B    magic            0x5A504B31（"ZPK1"）版本魔数
+4       1B    version          当前 = 1
+5       1B    flags            bit0: has_string_pool
+                               bit1: has_value_tape（动态路径）
+                               bit2: little_endian（当前始终为 1）
+                               bit3: schema_typed（主路径标志）
+6       2B    reserved         必须为 0
+8       4B    string_pool_off  Buffer Header 到 String Pool 起点的偏移
+12      4B    root_off         Buffer Header 到 Root Struct/Tape 起点的偏移
+```
+
+---
+
+### 4.3 String Pool
+
+**设计动机**：结构化数据中字符串高度重复（字段名、枚举值、固定标签）；集中存储便于去重；NUL 结尾与 C FFI（Swift `String(cString:)`、Kotlin `NewStringUTF`）直接兼容。
+
+```
+Offset  大小                内容
+──────  ──────────────────  ──────────────────────────────────
+0       4B                  pool_byte_len（字符串数据区总字节数）
+4       4B                  string_count
+8       string_count × 4B   index[]：每个字符串相对 pool_data 起点的偏移（u32）
+?       (pad to 8B)
+?       pool_byte_len B      pool_data[]：紧密排列的 NUL 结尾 UTF-8 字符串
+```
+
+**字符串句柄（string_handle）**：值槽中存储的是 `index[]` 数组的下标（u32），而非原始字节偏移。访问路径为两次 load：
+
+```
+string_handle → index[string_handle] → pool_data[index[string_handle]]
+```
+
+---
+
+### 4.4 Schema-Typed Struct 布局
+
+```
+Offset  大小                        内容
+──────  ─────────────────────────   ─────────────────────────────────────
+0       8B                          Struct Header
+                                      field_count_fixed: u16
+                                      field_count_var:   u16
+                                      struct_id:         u16（type name 哈希）
+                                      reserved:          u16 = 0
+8       field_count_fixed × 8B      Fixed Section（固定字段槽位区）
+?       field_count_var × 4B        Variable Offset Table（VOT）
+?       (pad to 8B)
+?       variable data               内联的嵌套 struct / array 数据
+```
+
+**字段分组与排序规则**（comptime 自动执行）：
+
+```
+Fixed 组（每字段 8B 槽）：
+  u64 / f64 / i64           → 优先排列（对齐最高）
+  u32 / f32 / i32
+  u16 / i16
+  u8 / bool / string_handle（u32）
+
+Variable 组（每字段在 VOT 中占 4B 偏移量）：
+  嵌套 struct、array、optional complex
+  保持 schema 定义中的顺序
+```
+
+**固定槽位（8B）编码规则**：
+
+| 类型 | 编码方式 |
+|---|---|
+| 整数 / 浮点 | 低位对齐，高位补零 |
+| bool | 0 或 1，占满 8B |
+| string_handle | u32 存低 4B，高 4B = 0 |
+| optional（nullable） | bit 63 = 1 表示 null，其余位存实际值 |
+| 连续 >4 个 bool 字段 | 打包为单个 8B 位域槽，访问器生成位提取代码 |
+
+使用 8B 统一步长的理由：等步长使 CPU prefetcher 可预测地预取下一个字段；字段索引计算退化为乘法加常量偏移，可被 LLVM 折叠为单条指令。
+
+---
+
+### 4.5 示例：Person struct 布局
+
+Schema 定义：
+
+```zig
+const Person = struct {
+    id:      u64,
+    age:     u8,
+    active:  bool,
+    score:   f32,
+    name:    []const u8,      // → string_handle（fixed）
+    tags:    [][]const u8,    // → string array（variable）
+    address: Address,         // → 嵌套 struct（variable）
+};
+```
+
+内存布局：
+
+```
+Offset  大小   内容
+──────  ─────  ──────────────────────────────────────────
+0       8B     Struct Header（field_count_fixed=4, field_count_var=2）
+8       8B     Fixed 槽 0：id（u64）
+16      8B     Fixed 槽 1：score（f32，存低4B）
+24      8B     Fixed 槽 2：name（string_handle，存低4B）
+32      8B     Fixed 槽 3：age（byte0）+ active（byte1）打包
+40      4B     VOT[0]：tags 相对本 struct 头的偏移
+44      4B     VOT[1]：address 相对本 struct 头的偏移
+48      ?      tags array 数据（inline）
+?       ?      address struct 数据（inline）
+```
+
+访问 `person.age`：
+
+```
+age = *(u8*)(buf + struct_base + 32)   // 单条 load，偏移为 comptime 常量
+```
+
+访问 `person.address.street`：
+
+```
+addr_off   = *(u32*)(buf + struct_base + 44)          // VOT[1]
+street_off = struct_base + addr_off + fixed_slot_N    // 子 struct 固定槽
+street_handle = *(u32*)(buf + street_off)             // string_handle
+str_ptr = pool_data + index[street_handle]            // 字符串指针
+```
+
+全程无分配，无哈希查找，无类型断言。
+
+---
+
+### 4.6 Array 布局
+
+```
+Offset  大小                内容
+──────  ──────────────────  ──────────────────────────────────
+0       4B                  element_count: u32
+4       2B                  element_type: u16（TypeTag 枚举值）
+6       2B                  flags: u16（bit0: uniform）
+
+[uniform scalar path，如 []f32、[]i64]
+8       element_count × sizeof(T)   紧密排列的原始数据
+
+[non-uniform / struct array path]
+8       element_count × 4B          offset_table[]（各元素相对数组头偏移）
+?       element data[]              各元素 inline struct 数据
+```
+
+**uniform 标志的意义**：标记为 uniform 的数组，其数据区是一段连续的同类型标量，访问器直接返回对应 Zig/C/Swift slice，调用方可以直接 SIMD 处理，无任何 per-element 开销。
+
+---
+
+## 5. 值编码策略
+
+### 5.1 动态值（ZValue Tape，可选路径）
+
+用于非 schema 的动态 JSON-like 数据。每个值固定 8 字节：
+
+```
+Bits 63..56   Bits 55..32   Bits 31..0
+┌───────────┬─────────────┬──────────────┐
+│  TYPE_TAG │   AUX/LEN   │   PAYLOAD    │
+│  (8 bits) │  (24 bits)  │  (32 bits)   │
+└───────────┴─────────────┴──────────────┘
+```
+
+TYPE_TAG 值定义：
+
+```
+0x00  Null
+0x01  False  / 0x02  True
+0x12  Int32（payload = i32 值）
+0x13  Int64（下一个 8B 存 i64 值，共 16B）
+0x14..0x17  UInt 系列
+0x20  Float32（payload = f32 bits）
+0x21  Float64（下一个 8B 存 f64 值，共 16B）
+0x30  String（payload = pool_handle u32）
+0x40  Array（payload = 相对 tape 起点的偏移）
+0x50  Object（payload = 相对 tape 起点的偏移）
+```
+
+Int64 和 Float64 占用连续两个 8B 槽（共 16B），类型标签始终在首个槽，便于线性扫描时 O(1) 跳过。
+
+### 5.2 Schema-Typed 固定槽（不存类型标签）
+
+Schema-typed 路径的固定槽不存储类型标签，类型在 comptime 已知。每个固定字段的访问器编译为特定类型的单条 load，完全消除运行时类型检查分支。
+
+---
+
+## 6. Zig comptime 代码生成
+
+### 6.1 核心 API
+
+```zig
+// 消费侧用法
+const PersonSchema = ZigPack.schema(Person);
+
+// 序列化（发生一次）
+var writer = PersonSchema.Writer.init(allocator);
+const buf: []const u8 = try writer.write(person_value);
+
+// 零拷贝读取（Zig 侧）
+const view = PersonSchema.View.init(buf);
+const id     = view.id();        // 单条 load，comptime 偏移
+const name   = view.name();      // 返回 []const u8 slice，指向 string pool，无拷贝
+const addr   = view.address();   // 返回 View(Address)，两条 load，无拷贝
+const tags   = view.tags();      // 返回 ArrayView，无拷贝
+
+// 跨语言 FFI 传递（唯一一次拷贝）
+const ptr: *anyopaque = buf.ptr;
+const len: usize      = buf.len;
+```
+
+### 6.2 comptime 布局计算
+
+```zig
+// 伪代码展示 comptime 信息流
+fn computeLayout(comptime T: type) LayoutMeta {
+    comptime {
+        const fields = std.meta.fields(T);  // comptime-only 操作
+
+        // 1. 分组：fixed（标量 + string_handle）vs variable（slice、嵌套 struct）
+        // 2. fixed 组：按对齐大小降序排列，计算 byte_offset（步长固定 8B）
+        // 3. variable 组：按定义顺序分配 vot_index
+        // 4. 计算 vot_start_offset = 8 + field_count_fixed * 8
+        // 5. 返回 []FieldMeta（comptime 常量数组）
+    }
+}
+```
+
+`std.meta.fields(T)` 在 comptime 返回 `[]const std.builtin.Type.StructField`。整个布局计算过程在编译期完成，运行时无任何开销。
+
+### 6.3 Writer（序列化器）生成
+
+```zig
+fn generateWriter(comptime T: type) type {
+    const Layout = computeLayout(T);
+    return struct {
+        buf:          std.ArrayList(u8),
+        string_pool:  StringInterner,   // 写入时对字符串去重
+
+        pub fn write(self: *@This(), value: T) ![]const u8 {
+            // comptime inline for：编译器为每个字段展开代码，无循环
+            inline for (Layout.fixed_fields) |fm| {
+                const v = @field(value, fm.name);
+                try self.writeFixedSlot(fm.byte_offset, v);
+            }
+            inline for (Layout.variable_fields) |fm| {
+                const v = @field(value, fm.name);
+                const rel_off = self.buf.items.len - self.struct_start;
+                try self.writeVotEntry(fm.vot_index, @intCast(u32, rel_off));
+                try self.writeChild(v);
+            }
+        }
+    };
+}
+```
+
+`inline for` 强制 LLVM 为每个字段特化代码，消除运行时分支和虚函数调用。
+
+### 6.4 View（零拷贝访问器）生成
+
+```zig
+fn generateView(comptime T: type) type {
+    const Layout = computeLayout(T);
+    return struct {
+        buf:  [*]const u8,   // 裸指针，不拥有数据
+        base: u32,           // 本 struct 在 buffer 中的起点偏移
+
+        // comptime 为每个 fixed 字段生成一个访问函数
+        // 例如 id() → @as(u64, @bitCast(buf[base + 8 ..][0..8].*))
+        // 编译为：mov rax, [rdi + base_const + 8]  （单条指令）
+
+        // 嵌套 struct：返回子 View，2 条 load，无拷贝
+        pub fn address(self: @This()) generateView(Address) {
+            const child_off = readU32(self.buf, self.base + Layout.vot_start + 4 * 1);
+            return generateView(Address){ .buf = self.buf, .base = self.base + child_off };
+        }
+
+        // Uniform array：返回 []const f32 slice，调用方直接 SIMD 处理
+        pub fn scores(self: @This()) []const f32 {
+            const arr_off = readU32(self.buf, self.base + Layout.vot_start + 4 * 0);
+            const arr_ptr = self.buf + self.base + arr_off;
+            const count   = readU32(arr_ptr, 0);
+            return @as([*]const f32, @ptrCast(@alignCast(arr_ptr + 8)))[0..count];
+        }
+    };
+}
+```
+
+View 类型仅包含两个字段（指针 + 偏移），按值传递开销极低。
+
+---
+
+## 7. 跨语言访问器生成
+
+### 7.1 生成流程
+
+```
+Zig 构建步骤（b.addRunArtifact）
+  输入：SchemaDescriptor（comptime 导出的 JSON 文件）
+  输出：PersonView.swift、PersonView.kt、PersonView.ts
+
+SchemaDescriptor 内容：
+  type_name、struct_id、field_count_fixed、vot_start
+  每个字段：name、type_tag、byte_offset 或 vot_index、nullable
+```
+
+### 7.2 Swift 访问器（示例）
+
+```swift
+// AUTO-GENERATED — do not edit
+// Source schema: Person (struct_id: 0xA3F1)
+
+import Foundation
+
+public struct PersonView {
+    private let buf: UnsafeRawBufferPointer
+    private let base: Int
+
+    public init(_ buffer: UnsafeRawBufferPointer, base: Int = 0) {
+        self.buf = buffer
+        self.base = base
+    }
+
+    // Fixed field: id (u64) at base+8
+    public var id: UInt64 {
+        buf.load(fromByteOffset: base + 8, as: UInt64.self)
+        // 编译为：ldr x0, [x0, #8]（单条 ARM64 指令）
+    }
+
+    // Fixed field: age (u8) at base+32, byte 0
+    public var age: UInt8 {
+        buf.load(fromByteOffset: base + 32, as: UInt8.self)
+    }
+
+    // Fixed field: score (optional f32) at base+16
+    public var score: Float? {
+        let slot = buf.load(fromByteOffset: base + 16, as: UInt64.self)
+        guard slot & 0x8000_0000_0000_0000 == 0 else { return nil }
+        return Float(bitPattern: UInt32(slot & 0xFFFF_FFFF))
+    }
+
+    // Fixed field: name (string) at base+24
+    public var name: String {
+        let handle   = buf.load(fromByteOffset: base + 24, as: UInt32.self)
+        let poolBase = Int(buf.load(fromByteOffset: 8, as: UInt32.self))
+        let strOff   = buf.load(fromByteOffset: poolBase + 8 + Int(handle) * 4, as: UInt32.self)
+        // indexSectionSize 由 codegen 根据 string_count 填入
+        let dataBase = poolBase + 8 + INDEX_SECTION_SIZE + Int(strOff)
+        return String(cString: buf.baseAddress!.advanced(by: dataBase))
+        // 注：String(cString:) 在此处发生一次拷贝（Swift 内存安全要求）
+    }
+
+    // Variable field: address (nested struct) — VOT index 1
+    public var address: AddressView {
+        let childOff = buf.load(fromByteOffset: base + VOT_START + 4, as: UInt32.self)
+        return AddressView(buf, base: base + Int(childOff))
+    }
+}
+```
+
+### 7.3 Kotlin 访问器（示例）
+
+使用 `java.nio.ByteBuffer`（direct/off-heap）：GC 不管理 buffer 内存，无 GC 压力。
+
+```kotlin
+// AUTO-GENERATED — do not edit
+// Source schema: Person (struct_id: 0xA3F1)
+
+class PersonView(private val buf: java.nio.ByteBuffer, private val base: Int = 0) {
+
+    init { buf.order(java.nio.ByteOrder.LITTLE_ENDIAN) }
+
+    // Fixed field: id (u64) at base+8
+    val id: Long get() = buf.getLong(base + 8)
+    // JIT 内联后等价于单条 native load 指令
+
+    // Fixed field: age (u8) at base+32
+    val age: Short get() = (buf.get(base + 32).toInt() and 0xFF).toShort()
+
+    // Fixed field: score (optional f32) at base+16
+    val score: Float? get() {
+        val slot = buf.getLong(base + 16)
+        if (slot and Long.MIN_VALUE != 0L) return null
+        return java.lang.Float.intBitsToFloat((slot and 0xFFFFFFFFL).toInt())
+    }
+
+    // Variable field: address — VOT index 1
+    val address: AddressView get() {
+        val off = buf.getInt(base + VOT_START + 4)
+        return AddressView(buf, base + off)
+        // AddressView 对象在 JVM 堆分配，但字段数据仍在 off-heap buffer
+    }
+
+    companion object {
+        private const val VOT_START = 8 + 4 * 8  // 由 codegen 填入
+    }
+}
+```
+
+### 7.4 各语言字段访问开销对比
+
+```
+语言        标量字段          字符串字段              嵌套 struct
+────────    ─────────────     ────────────────────    ─────────────────
+Zig         1 load            2 load（无拷贝）         2 load + 子base
+Swift       1 load            ~4 load + 1 copy        3 load
+Kotlin      1 JIT load        ~6 load + 1 copy        3 JIT load + 1 alloc
+TypeScript  DataView.getXxx   TextDecoder + copy      递归调用
+```
+
+字符串是唯一必然发生拷贝的数据类型（Swift 内存安全、JVM 堆模型要求）。所有标量字段和嵌套结构均可真正零拷贝访问。
+
+---
+
+## 8. SIMD 优化策略
+
+ZigPack 在以下四个位置利用 SIMD：
+
+### 8.1 写入时：字符串去重（String Interning）
+
+写入字符串时需要在 String Pool 中查找是否已存在相同字符串。Pool 的 `pool_data` 区是紧密排列的 NUL 结尾字符串序列，可用 SIMD 加速边界检测：
+
+```zig
+// Stage 1：用 16-wide NUL 扫描找到所有字符串边界
+const Vec = @Vector(16, u8);
+const nul_vec: Vec = @splat(0);
+// 每次处理 16B，检测 NUL 位置，记录字符串起点
+// 等效于 simdjson Stage 1 的 structural character detection
+
+// Stage 2：对候选字符串做 16-wide 向量比较
+// needle.len <= 16 时：单次 VPCMPEQB + PMOVMSKB 完成比较
+```
+
+### 8.2 读取时：Uniform Array 的 SIMD 处理
+
+Uniform scalar array 的 `scores()` 访问器直接返回 `[]const f32` slice。调用方的 `inline for` 循环由 Zig/LLVM 自动向量化：
+
+```zig
+// 调用方代码（用户写的）
+const arr = view.scores();
+var sum: f32 = 0;
+for (arr) |v| sum += v;
+// LLVM 自动生成 AVX2 VADDPS（每次处理 8 个 f32）
+// 前提：buffer 基地址至少 8B 对齐（设计保证），最优需 32B 对齐
+```
+
+### 8.3 读取时：动态对象字段查找
+
+动态（ZValue tape）路径中，在大型 object 中按名查找字段时，同样用 Stage1/Stage2 两阶段 SIMD 扫描 String Pool。Schema-typed 路径不需要此优化（偏移全部为 comptime 常量）。
+
+### 8.4 Buffer 跨语言传递时的 memcpy
+
+当 buffer 需要跨进程或网络传输时，连续内存布局保证了一次大块 `memcpy`（而非分散拷贝），触发 x86 `REP MOVSB` / ARM64 `LD1-ST1` 向量化路径，接近内存带宽上限。
+
+### 对齐要求
+
+- Buffer allocator 需提供至少 **8B 对齐**（保证所有字段自然对齐）
+- 存储大型 float array 时推荐 **32B 对齐**（满足 AVX2 aligned load）
+- Array 头部（8B）后 element 数据自动 8B 对齐，满足 SSE2 要求
+
+---
+
+## 9. 模块结构
+
+```
+z_channel/
+├── z_core/src/
+│   ├── root.zig           对外重导出
+│   ├── format.zig         常量：magic、TypeTag 枚举、Header struct
+│   ├── layout.zig         comptime 布局计算（FieldMeta、computeLayout）
+│   ├── writer.zig         comptime Writer 生成（序列化器）
+│   ├── view.zig           comptime View 生成（零拷贝访问器）
+│   ├── string_pool.zig    StringInterner（写）+ StringPoolView（读）
+│   ├── array.zig          ArrayWriter + ArrayView
+│   ├── value.zig          ZValue 动态 tape（可选路径）
+│   └── simd.zig           SIMD 辅助函数（NUL 扫描、向量比较）
+│
+├── z_lib/src/
+│   ├── root.zig           公共 API：ZigPack.schema()、ZigPack.dynamic()
+│   └── codegen/
+│       ├── descriptor.zig SchemaDescriptor 类型 + comptime 导出
+│       ├── swift_gen.zig  Swift 访问器代码生成器
+│       └── kotlin_gen.zig Kotlin 访问器代码生成器
+│
+└── example/src/
+    └── main.zig           使用示例：定义 schema → 序列化 → 零拷贝读取
+```
+
+构建流程：
+
+```
+build.zig.zon 声明 workspace
+  → z_core（无外部依赖）
+  → z_lib（依赖 z_core）
+  → example（依赖 z_lib）
+
+z_lib/build.zig 添加构建步骤：
+  b.addRunArtifact(codegen_exe)  → 生成 Swift/Kotlin 访问器源文件
+  （仅当 SchemaDescriptor 哈希变化时重新生成）
+```
+
+---
+
+## 10. 设计决策汇总
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 偏移方式 | 纯相对偏移（u32） | Position-independent，可 mmap / 落盘 / 跨进程 |
+| 字符串存储 | 集中 String Pool + u32 handle | 去重、NUL 结尾与 C FFI 兼容、handle 尺寸小 |
+| 固定字段布局 | comptime 计算偏移，8B 等步长 | O(1) 单 load 访问，LLVM 折叠偏移计算 |
+| Null 标记 | bit 63 of 8B slot | 无额外 null bitmap，单次 AND+branch |
+| 可变字段导航 | Variable Offset Table (VOT) | O(1) 定位，VOT 本身 comptime 已知 |
+| 数组格式 | uniform/non-uniform 双路径 | uniform 路径支持直接 SIMD slice |
+| 动态类型 | 可选 ZValue tape | 仅在需要动态 JSON-like 数据时引入，主路径无开销 |
+| Schema 定义 | Zig 原生 struct + comptime | 无 IDL 文件，类型系统统一，无阻抗失配 |
+| 外语代码生成 | 构建时 codegen（Zig 可执行文件） | IDE 友好（有类型、有补全），无运行时反射开销 |
+| Swift 实现方式 | UnsafeRawBufferPointer + Macro | 与 Swift 类型系统融合，访问器代码简洁 |
+| Kotlin 实现方式 | ByteBuffer（direct/off-heap） | 无 GC 压力，JIT 可 inline 为单条 load |
+
+---
+
+## 11. 与同类方案对比
+
+| 特性 | ZigPack | Protobuf | FlatBuffers | Cap'n Proto | MessagePack |
+|---|---|---|---|---|---|
+| 零拷贝读取 | ✅ | ❌（需解码） | ✅ | ✅ | ❌（需解码） |
+| Schema 在语言原生定义 | ✅（Zig struct） | ❌（.proto IDL） | ❌（.fbs IDL） | ❌（.capnp IDL） | ❌（无 schema） |
+| 跨语言 FFI | ✅ | ✅（库支持） | ✅ | ✅ | ✅ |
+| 字符串去重 | ✅（String Pool） | ❌ | ❌ | ❌ | ❌ |
+| 自动 SIMD 数组 | ✅（uniform slice） | ❌ | 部分 | ❌ | ❌ |
+| 运行时字段查找 | ❌（comptime 偏移） | N/A | ❌（vtable） | ❌（偏移表） | N/A |
+| 编译期代码生成 | ✅（comptime） | ✅（protoc） | ✅（flatc） | ✅（capnpc） | ❌ |
+| buffer 大小上限 | 4GiB（u32 偏移） | 无（流式） | 4GiB | 4GiB | 无 |
+
+主要差异化：ZigPack 的 schema 直接在 Zig struct 中定义（无独立 IDL 文件），comptime 生成访问器与 Zig 类型系统无缝融合，同时通过 String Pool 提供跨字段的字符串去重能力。
+
+---
+
+## 12. 待评审问题
+
+以下问题需要在技术评审中确认：
+
+1. **字节序**：当前设计假设 little-endian（bit2 标志）。是否需要支持 big-endian 目标（如某些嵌入式平台）？如需支持，访问器是否在读取时做字节序转换，还是序列化时统一为网络字节序？
+
+2. **u32 偏移上限（4GiB）**：是否有超过 4GiB 的单个 buffer 需求？如有，需改为 u64 偏移，代价是每个 VOT 条目和 string handle 翻倍。
+
+3. **Schema 演化（版本兼容性）**：当前设计不支持字段的增删（字段偏移在 comptime 固化）。是否需要支持前向/后向兼容性？若需要，参考 FlatBuffers vtable 方案（增加每个字段的存在性检查，牺牲部分性能）。
+
+4. **嵌套 struct 内联 vs 引用**：当前设计将嵌套 struct 数据内联在父 struct 的 variable data 区。对于被多个父 struct 共享的子 struct（如同一 Address 被多人引用），是否需要支持引用语义（共享同一块子 struct 数据）？
+
+5. **String Pool 构建的内存使用**：序列化时 StringInterner 需要临时哈希表存储所有已见字符串。对于大量小对象的批量序列化，此哈希表的内存峰值是否可接受？
+
+6. **对齐保证**：生成的 buffer 需要 allocator 提供至少 8B 对齐，最优 32B 对齐（AVX2）。通过 FFI 传递给外语时，需要外语侧保证不重新分配到不对齐的内存中，这一约束是否可以接受？
+
+7. **TypeScript 路径**：TypeScript 通过 `DataView` 访问 `ArrayBuffer`，性能低于原生。是否需要 WASM 桥接（在 WASM 模块中运行 Zig 生成的访问器代码，通过 JS interop 暴露）？
+
+8. **动态路径（ZValue tape）的优先级**：当前设计中动态路径是可选的。是否有明确的使用场景需要在第一版中支持动态路径？
+
+---
+
+*文档结束。如需修改或补充，请在评审中提出。*
