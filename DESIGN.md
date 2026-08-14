@@ -1,7 +1,7 @@
 # ZigPack：零拷贝跨语言二进制序列化格式
 
 > **状态**：设计草稿，待技术评审
-> **版本**：v0.4（评审修订：slot_count_fixed 语义更名、字符串数组 uniform 路径、variable data 对齐规则、Writer 伪代码对齐两段式、单一 pool 不变量）
+> **版本**：v0.5（正确性修订：嵌套 struct 对齐判定改用绝对偏移、optional 零扩展位编码；格式优化：数组数据区统一 +8、大数组头落 32k+24；表述收紧：Writer 三阶段、外语双构造器）
 > **作者**：待填写
 > **日期**：2026-08-14
 
@@ -168,7 +168,7 @@ Offset  大小                        内容
                                       schema_name_hash:  u32（fnv32a，debug 用）
 8       slot_count_fixed × 8B      Fixed Section（固定字段槽位区）
 ?       field_count_var × 4B        Variable Offset Table（VOT）
-?       (pad to 8B)
+?       (padding)                   ← 派生结果，非独立规则（见下）
 ?       variable data               内联的嵌套 struct / array 数据
 ```
 
@@ -178,7 +178,15 @@ Offset  大小                        内容
 
 > **slot_count_fixed 语义**：Struct Header 中的 `slot_count_fixed` 是 **Fixed Section 的 8B 槽位数**，不是 fixed 字段数——sub-word 打包后多个字段共享一个槽，两者可能不相等（如 4.5 中 fixed 字段 5 个、槽位 4 个）。`vot_start = 8 + slot_count_fixed * 8` 仅在槽位语义下成立。运行时读取路径不使用该值（vot_start 是 comptime 常量），仅用于 debug / 布局校验。
 
-> **variable data 区的对齐规则**：variable data 区按声明顺序追加子对象（嵌套 struct、array、full-width optional 数据块）。**每个子对象的起点必须相对本 struct 头 8B 对齐**——writer 在追加前插入 ≤7B padding，VOT 条目指向 padding 后的子对象起点（uniform 数组要求 32B 对齐，padding ≤31B，见 4.6）。这条规则保证嵌套 struct 的 sub-word 字段（如 2B 对齐的 u16）在最终 buffer 中自然对齐：root struct 的起点已 32B 对齐（见 6.3 组装规则），每个嵌套 struct 的 base = 父 base + 8 的倍数，因此**所有 struct base 均为 8 的倍数**，unaligned access 的隐含前提由此成立。
+> **variable data 区的对齐规则（唯一一条 padding 规则）**：variable data 区按声明顺序追加子对象（嵌套 struct、array、full-width optional 数据块）。每个子对象的起点由**该子对象自身的对齐需求**决定——嵌套 struct 与 full-width optional 数据块 = 8B，array 见 4.6。writer 在追加前插入 padding，VOT 条目指向 padding 后的子对象起点。
+>
+> **⚠ 对齐判定必须基于 struct 段缓冲（struct_buf）内的绝对偏移，而不是相对本 struct 头的偏移。** 原因：struct_buf 偏移 0 对应最终 buffer 的 `root_off`，而组装规则保证 `root_off ≡ 0 (mod 32)`（见 6.3），因此 `struct_buf_offset ≡ 0 (mod k)` ⟹ 该位置在最终 buffer 中也 kB 对齐（k ∈ {8, 32}）。而 VOT 条目只是相对增量，其自身不保证是 8 或 32 的倍数，**嵌套 struct 的 base 因此不继承父 struct 的对齐等级**。
+>
+> 反例（说明为何不能用相对偏移判定）：`root_off = 32`，`address` 子 struct 的 VOT 条目 = 8 ⟹ `address` base = 40。若其内部 uniform 数组头"相对 address 头"对齐到 32（即 base+32 = 72），则 72 mod 32 = 8，在最终 buffer 中**并未 32B 对齐**。
+>
+> 结论：**对齐判定用 struct_buf 绝对位置，VOT 只记录相对增量**（`rel_off = child_struct_buf_offset − struct_start`）。这条规则同时覆盖 8B 与 32B 两种需求，且对任意嵌套深度成立。
+
+> **布局图中 `(padding)` 行的性质**：它是上述规则在**第一个子对象**上的实例，**不是独立规则**。此外当 `field_count_var` 为奇数时，VOT 区（4B 步长）末尾会自然产生 4B 空隙，被该 padding 吸收。实现者只需实现上面这一条对齐逻辑。
 
 ---
 
@@ -241,9 +249,25 @@ Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时�
 
 **Step 3：optional null 标记**
 
-- non-full-width optional（`?u32`、`?u16`、`?u8`、`?bool` 等）：**bit 63 = 1** 表示 null，其余位存实际值。此方案对这些类型安全，因为：
-  - `?u32`：低 32 位存值，bit 63 为 null 标记，中间 31 位置零，无冲突
-  - `?u16/u8/bool`：值更小，高位空间更充裕
+non-full-width optional（`?u32`、`?i32`、`?f32`、`?string_off`、`?u16`、`?i16`、`?u8`、`?i8`、`?bool`）使用 8B 槽的 **bit 63** 作为 null 标记。位编码规则如下，**无二义、统一覆盖上述全部类型**：
+
+```
+非 null：把值的位模式【零扩展】到低 N 位（N = 8/16/32），
+         bit N..63 全部为 0（含 bit 63）。
+         ⚠ 严禁符号扩展 —— 负数符号扩展会填满高 32 位并误置 bit 63，
+           直接破坏 null 语义。
+         例：?i32 = -1  →  slot = 0x0000_0000_FFFF_FFFF
+                          （不是 0xFFFF_FFFF_FFFF_FFFF）
+
+null   ：bit 63 = 1，其余位全 0（slot = 0x8000_0000_0000_0000）。
+
+解码  ：测 bit 63；为 0 则截断到该字段位宽，再 bitcast 到字段类型
+         —— 符号扩展由 bitcast 自然产生，与槽位无关。
+         例：?i32 → @as(i32, @bitCast(@as(u32, @truncate(slot))))
+```
+
+> **实现陷阱**：writer 若"自然地"写成 `@as(u64, @bitCast(@as(i64, value)))`，`?i32 = -1` 会被写成全 1，读回时被误判为 null。必须先转成同宽无符号类型再零扩展：`@as(u64, @as(u32, @bitCast(value)))`。
+
 - full-width optional（`?u64`、`?i64`、`?f64`）：**降级至 Variable 组，数据块动态分配**——null 时**不写入任何数据块**，VOT 条目 = `0xFFFF_FFFF`；非 null 时在 variable data 区按字段声明顺序追加一个 8B 数据块，VOT 条目指向它。不存在静态保留槽：静态保留会使 VOT 条目永远非 `0xFFFF_FFFF`，与 null 哨兵语义冲突，故明确排除。
 
 ---
@@ -317,11 +341,13 @@ Offset  大小   内容
 40      4B     VOT[0]：tags 相对本 struct 头的偏移
 44      4B     VOT[1]：address 相对本 struct 头的偏移
 48      4B     VOT[2]：uid 相对本 struct 头的偏移（0xFFFF_FFFF = null）
-52      4B     (pad to 8B)
-56      ?      tags uniform string array 数据（element_type=String，见 4.6）
-?       ?      address struct 数据（inline）
+52      4B     (padding：VOT 条目数为奇数时的自然空隙 + 首个子对象的对齐 padding)
+56      ?      tags uniform string array（element_type=String，数据区在数组头 +8，见 4.6）
+?       ?      address struct 数据（inline，8B 对齐）
 ?       8B     uid 数据块（内联的 u64，动态分配：仅当 VOT[2] ≠ 0xFFFF_FFFF 时存在，null 时整个数据块不写入）
 ```
+
+> 上表的 `56` 是 tags 元素少于 8 个（`count × 4 < 32`）时的结果——小数组只需 8B 对齐。若 tags 有 ≥8 个元素，writer 会把数组头推到 struct_buf 绝对偏移 ≡ 24 (mod 32) 的位置，VOT[0] 相应变大，读取端无感。
 
 **访问示例**：
 
@@ -360,35 +386,72 @@ Offset  大小                内容
 ──────  ──────────────────  ──────────────────────────────────
 0       4B                  element_count: u32
 4       2B                  element_type: u16（TypeTag 枚举值）
-6       2B                  flags: u16（bit0: uniform）
+6       2B                  flags: u16（bit0: uniform，bit1: data_32b_aligned）
 
 [uniform scalar path，如 []f32、[]i64]
-8       24B padding                数据区固定起始于数组头 +32（见下）
-32      element_count × sizeof(T)  紧密排列的原始数据（32B 对齐）
+8       element_count × sizeof(T)   紧密排列的原始数据
 
 [uniform string path，如 [][]const u8]
-32      element_count × 4B         紧密排列的 string_off（u32），element_type = String
+8       element_count × 4B          紧密排列的 string_off（u32），element_type = String
 
 [non-uniform / struct array path]
 8       element_count × 4B          offset_table[]（各元素相对数组头偏移）
 ?       element data[]              各元素 inline struct 数据
 ```
 
-**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（element_type 取 TypeTag 的 String 值，见 5.1），同样满足 32B 对齐、元素紧密连续、无 per-element 头。访问器可返回 `[]u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。嵌套 struct 数组走 non-uniform 路径（元素是完整的子 struct，需 offset table 定位）。
+**数据区永远位于数组头 +8**——uniform 路径的裸元素区、non-uniform 路径的 offset_table 都从 +8 开始。访问器无分支、偏移恒为 comptime 常量，三条路径共用同一条寻址公式。
 
-**uniform 数组的 32B 对齐**：数据区固定从数组头 +32 开始——偏移是常量，访问器无需运行时计算；SIMD 循环可使用 aligned load，无 cache-line split。对齐成立的条件链为：
+**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（element_type 取 TypeTag 的 String 值，见 5.1），元素紧密连续、无 per-element 头。访问器可返回 `[]const u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。嵌套 struct 数组走 non-uniform 路径（元素是完整的子 struct，需 offset table 定位）。
+
+> **字符串数组做 SIMD 对齐为何有意义**：String Pool 做了去重，因此**字符串相等 ⟺ string_off 相等**。`tags.contains(s)` 可退化为：先 `intern(s)` 得到 u32 偏移，再对 `[]const u32` 做 SIMD 相等比较（AVX2 一次比 8 个），完全不触碰 pool_data。这使 uniform string array 的向量化有真实业务语义，对齐收益成立。
+
+---
+
+#### 数组头的落位规则（writer 职责）
+
+writer 决定数组头在 struct 段缓冲中的落位，**判定基于 struct_buf 绝对偏移**（见 4.4 对齐规则）：
 
 ```
-buffer 基地址 32B 对齐（allocator 硬性保证，见 8）
-  → 组装时 Pool 段末尾补齐，使 root_off 为 32 的倍数（见 6.3）
-  → writer 在写入 uniform 数组前插入最多 31B 填充，
-    使数组头相对 struct 段起点落在 32B 边界       ← writer 的显式职责
-  → 数组头 +32 的数据区在最终 buffer 中 32B 对齐
+若 element_count × sizeof(elem) ≥ 32：
+    数组头对齐到 32k + 24  →  数据区（头 +8）起于 32(k+1)，天然 32B 对齐
+    置 flags bit1 = 1
+否则（小数组）：
+    数组头对齐到 8B        →  仅保证元素自然对齐
+    置 flags bit1 = 0
 ```
 
-variable data 区是连续追加的，数组头不会自然落在 32B 边界，**这步填充必须由 writer 主动完成**。VOT 条目指向填充之后的数组头，读取端永远看不到填充。代价：每个 uniform 数组最多 31B（头部对齐填充）+ 24B（头内 8→32 填充）≈ 55B 开销（性能优先于体积的取舍）。
+数组头恰好占 8B（count 4B + type 2B + flags 2B），因此把**头**放在 `32k+24` 就能让**数据区**落在 32B 边界，且访问器偏移仍是常量 `+8`——**内部 padding 为 0**。
 
-**uniform 标志的意义**：标记为 uniform 的数组，其数据区是一段连续的同类型标量，访问器直接返回对应 Zig/C/Swift slice，调用方可以直接 SIMD 处理，无任何 per-element 开销。
+> v0.4 曾采用"数组头 ≡ 0 (mod 32)、数据区 = 头 +32"，头内固定浪费 24B。新方案在完全相同的访问代码下消除了这 24B，每数组开销从 ≤55B 降到 ≤31B（仅前导对齐 padding）。
+
+> **小数组为何豁免**：`count × sizeof < 32` 的数组填不满一个 AVX2 向量，32B 对齐无收益，反而会插入最多 31B padding 把数据推离父 struct、拉长跨 cache line 的距离。小数组只要 8B 对齐。
+
+对齐成立的完整条件链：
+
+```
+buffer 基地址 32B 对齐                       ← allocator 硬性保证（见 8）
+  → 组装时 Pool 段末尾补齐，root_off ≡ 0 (mod 32)   ← 见 6.3
+  → struct_buf 偏移 0 映射到 root_off
+  ⟹ struct_buf 绝对偏移 ≡ 0 (mod 32) 的位置，在最终 buffer 中 32B 对齐
+  → writer 使数组头落在 struct_buf 绝对偏移 ≡ 24 (mod 32)
+  → 数据区（头 +8）在最终 buffer 中 32B 对齐            ✔ 任意嵌套深度成立
+```
+
+VOT 条目指向 padding 之后的数组头，读取端永远看不到 padding。
+
+---
+
+#### 访问器的对齐处理
+
+访问器返回**元素自然对齐**的 slice（`[]const f32` → align 4），**不做 `@alignCast(32)`**：
+
+- LLVM 会发 `vmovups`（unaligned move）。在 Haswell+ / Apple Silicon 上，unaligned 指令访问**已对齐**数据与 aligned 指令吞吐完全相同
+- 真正的性能收益是**避免 cache-line split**，这由 writer 的对齐保证提供，与指令选择无关
+- 不 `@alignCast` 也就避免了"外语侧 buffer 只有 8B 对齐时 UB"的风险
+
+`flags bit1: data_32b_aligned` 仅记录 writer 是否做了对齐，**供 debug / 内省使用，读路径不读取它**。
+
+**uniform 标志（bit0）的意义**：标记为 uniform 的数组，其数据区是一段连续的同类型标量，访问器直接返回对应 Zig/C/Swift slice，调用方可以直接 SIMD 处理，无任何 per-element 开销。
 
 ---
 
@@ -478,30 +541,43 @@ fn computeLayout(comptime T: type) LayoutMeta {
 fn generateWriter(comptime T: type) type {
     const Layout = computeLayout(T);
     return struct {
-        struct_buf:   std.ArrayList(u8),  // struct 段（临时缓冲，见下方"两段式"）
-        pool:         StringInterner,     // pool 段（独立构建）；intern() 返回该字符串
-                                           // 在 pool_data 中的最终偏移（插入时确定，无需 fixup）
-        struct_start: usize,              // 当前正在写入的 struct 在 struct_buf 中的起点
+        struct_buf: std.ArrayList(u8),  // struct 段（临时缓冲，见下方"两段式"）
+        pool:       StringInterner,     // pool 段（独立构建）；intern() 返回该字符串
+                                        // 在 pool_data 中的最终偏移（插入时确定，无需 fixup）
 
-        pub fn write(self: *@This(), value: T) ![]const u8 {
-            self.struct_start = self.struct_buf.items.len;
+        /// 序列化一个 struct，返回其在 struct_buf 中的起点（供父级算相对偏移）
+        fn writeStruct(self: *@This(), comptime S: type, value: S) !usize {
+            const L = computeLayout(S);
+            // ── 阶段 1：RESERVE ──
+            const struct_start = self.struct_buf.items.len;
+            try self.struct_buf.appendNTimes(0, L.header_and_body_size);
+            // header_and_body_size = 8 + slot_count_fixed*8 + field_count_var*4
 
-            // comptime inline for：编译器为每个字段展开代码，无循环
-            inline for (Layout.fixed_fields) |fm| {
+            // ── 阶段 2：FIXED（定点回填，非 append）──
+            inline for (L.fixed_fields) |fm| {
                 const v = @field(value, fm.name);
-                try self.writeFixedSlot(self.struct_start + fm.slot_offset, v);
+                // 字符串字段：先 intern 拿到 string_off 再写槽
+                self.pokeSlot(struct_start + fm.slot_offset, fm, v);
             }
-            inline for (Layout.variable_fields) |fm| {
+
+            // ── 阶段 3：VARIABLE（append 数据 + 定点回填 VOT）──
+            inline for (L.variable_fields) |fm| {
                 const v = @field(value, fm.name);
-                // 子对象按自然对齐落位（struct/array 8B、uniform array 32B，见 4.4 对齐规则），
-                // VOT 条目指向 padding 后的子对象起点
-                const rel_off = try self.placeChildAligned(fm.child_align);
-                try self.writeVotEntry(self.struct_start, fm.vot_index, rel_off);
+                if (fm.is_optional and v == null) {
+                    self.pokeVot(struct_start, L.vot_start, fm.vot_index, 0xFFFF_FFFF);
+                    continue;
+                }
+                // a. 按子对象对齐需求 append padding
+                //    ⚠ 判定基于 struct_buf 绝对偏移，不是相对 struct_start（见 4.4）
+                try self.padTo(fm.childAlignSpec(v));
+                // b. 相对增量
+                const rel_off = self.struct_buf.items.len - struct_start;
+                // c. 定点回填 VOT 槽
+                self.pokeVot(struct_start, L.vot_start, fm.vot_index, @intCast(rel_off));
+                // d. 递归序列化子对象（嵌套 struct 从阶段 1 重新开始）
                 try self.writeChild(v);
             }
-
-            // 全部写完后组装：Header + pool 段 + struct 段，回填 string_pool_off / root_off
-            // （root_off 需 32B 对齐，见下方组装规则）
+            return struct_start;
         }
     };
 }
@@ -509,13 +585,32 @@ fn generateWriter(comptime T: type) type {
 
 `inline for` 强制 LLVM 为每个字段特化代码，消除运行时分支和虚函数调用。
 
+**三阶段（reserve-then-backfill）**：VOT 条目位于固定区、子对象数据追加在尾部，两者写入顺序天然相反。做法是**先一次性预留 Header + Fixed Section + VOT 的全部字节，再定点回填**：
+
+```
+1. RESERVE  — struct_start = struct_buf.len
+              append (8 + slot_count_fixed*8 + field_count_var*4) 个零字节
+
+2. FIXED    — 对每个 fixed 字段，随机写入
+              struct_buf.items[struct_start + slot_offset ..]
+
+3. VARIABLE — 按声明顺序，对每个 variable 字段：
+              a. append 对齐 padding（判定基于 struct_buf 绝对偏移）
+              b. rel_off = struct_buf.len − struct_start
+              c. 随机写入 struct_buf.items[struct_start + vot_start + 4*vot_index]
+                 （null 的 full-width optional 写 0xFFFF_FFFF 并跳过 d）
+              d. 递归序列化子对象（从步骤 1 重新开始）
+```
+
+关键点：`struct_buf` 必须支持对**已 append 区域**的随机写（`ArrayList(u8).items[i]` 直接可写）。这不是"边算边填"的复杂 fixup 链，而是**预留 + 定点回填**，全程单次遍历，无二次扫描。`padTo` 承担步骤 a，`pokeVot` 承担步骤 c。
+
 **Writer 写入顺序（两段式）**：最终 buffer 布局是 Header → String Pool → Root Struct，但字符串只有在遍历 struct 时才会被发现（Pool 无法先写完），因此 Writer 采用两段式构建：
 
 1. **struct 段**：将 root struct（含全部嵌套数据）序列化到独立的临时缓冲。期间每遇到字符串就调用 `StringInterner.intern()`，把返回的最终偏移直接写入值槽——偏移相对 pool_data 自身起点，与 struct 段最终摆放位置无关，**struct 段无任何 fixup**。
 2. **pool 段**：String Pool 始终在独立的 pool_data 缓冲中增量构建（intern 时追加，偏移即时确定），与 struct 段并行推进。
 3. **组装**：全部字段写完后，按 Header(16B) + Pool + struct 段输出最终 buffer，回填 Header：`string_pool_off = 16`，`root_off = 16 + pool_total_len`。组装时 struct 段发生一次 memcpy（序列化的一次性成本，可接受）。
 
-> **root_off 的 32B 补齐**：struct 段内的所有对齐（含 uniform 数组的 32B 对齐填充）都是相对 struct 段起点计算的，而 struct 段在最终 buffer 中位于 `root_off = 16 + pool_total_len`，pool 长度不定。因此组装时必须在 Pool 段末尾补齐 padding（最多 31B），使 `root_off` 为 32 的倍数——这样 struct 段内的相对对齐在最终 buffer 中原样生效，struct 段本身无需感知自己在 buffer 中的位置。
+> **root_off 的 32B 补齐**：struct 段内的所有对齐（含 uniform 数组的对齐 padding）都是按 **struct 段内绝对偏移**计算的，而 struct 段在最终 buffer 中位于 `root_off = 16 + pool_total_len`，pool 长度不定。因此组装时必须在 Pool 段末尾补齐 padding（最多 31B），使 `root_off ≡ 0 (mod 32)`——这样 struct 段内的绝对偏移与最终 buffer 偏移**同余于 32**，段内计算的对齐在最终 buffer 中原样生效，struct 段本身无需感知自己的落位。这也是 4.4 "用绝对偏移判定对齐"能成立的唯一依据。
 
 ### 6.4 View（零拷贝访问器）生成
 
@@ -545,8 +640,11 @@ fn generateView(comptime T: type) type {
             const arr_off = readU32(self.buf, self.base + Layout.vot_start + 4 * 0);
             const arr_ptr = self.buf + self.base + arr_off;
             const count   = readU32(arr_ptr, 0);
-            // 数据区固定位于数组头 +32（32B 对齐，见 4.6）
-            return @as([*]const f32, @ptrCast(@alignCast(arr_ptr + 32)))[0..count];
+            // 数据区固定位于数组头 +8（见 4.6）。只按元素自然对齐做 ptrCast，
+            // 不 @alignCast(32)：writer 已保证大数组数据区 32B 对齐，
+            // LLVM 发 vmovups 在已对齐数据上与 aligned load 同吞吐。
+            const p: [*]align(@alignOf(f32)) const u8 = @alignCast(arr_ptr + 8);
+            return @as([*]const f32, @ptrCast(p))[0..count];
         }
     };
 }
@@ -585,11 +683,18 @@ public struct PersonView {
     private let base: Int
     private let poolData: Int   // pool_data 基址，init 时算好并缓存
 
-    public init(_ buffer: UnsafeRawBufferPointer, base: Int = 0) {
+    /// Root 入口：从 Header 读一次 root_off 与 pool 基址
+    public init(_ buffer: UnsafeRawBufferPointer) {
+        self.buf      = buffer
+        self.base     = Int(buffer.load(fromByteOffset: 12, as: UInt32.self))      // root_off
+        self.poolData = Int(buffer.load(fromByteOffset:  8, as: UInt32.self)) + 8  // pool_data
+    }
+
+    /// 嵌套入口：base 与 poolData 沿 View 链传递，不重读 Header
+    internal init(_ buffer: UnsafeRawBufferPointer, base: Int, poolData: Int) {
         self.buf = buffer
         self.base = base
-        let poolOff = Int(buffer.load(fromByteOffset: 8, as: UInt32.self))
-        self.poolData = poolOff + 8
+        self.poolData = poolData
     }
 
     // Fixed field: id (u64) at base+8
@@ -617,20 +722,22 @@ public struct PersonView {
 
     // Variable field: address (nested struct) — VOT index 1
     public var address: AddressView {
-        let childOff = buf.load(fromByteOffset: base + VOT_START + 4, as: UInt32.self)
-        return AddressView(buf, base: base + Int(childOff))
+        let childOff = buf.load(fromByteOffset: base + Self.VOT_START + 4, as: UInt32.self)
+        return AddressView(buf, base: base + Int(childOff), poolData: poolData)  // ← 显式传递 pool
     }
 
     // Variable field: uid (optional u64) — VOT index 2，0xFFFF_FFFF = null
     public var uid: UInt64? {
-        let off = buf.load(fromByteOffset: base + VOT_START + 8, as: UInt32.self)
+        let off = buf.load(fromByteOffset: base + Self.VOT_START + 8, as: UInt32.self)
         guard off != 0xFFFF_FFFF else { return nil }
         return buf.load(fromByteOffset: base + Int(off), as: UInt64.self)
     }
 
-    private static let VOT_START = 40  // 由 codegen 填入
+    private static let VOT_START = 40  // = 8 + slot_count_fixed(=4) * 8，由 codegen 填入
 }
 ```
+
+> **双构造器模式对所有语言统一**：public root 构造器从 Header 读 `root_off`（偏移 12）与 `pool_data`（偏移 8 的值 +8）；internal 嵌套构造器接收 `(buf, base, poolData)`，与 Zig 侧 `View{buf, base, pool}` 三字段一一对应。**嵌套 View 必须显式传递 `poolData`**（单一 pool 不变量保证其安全，见 6.4），不得重读 Header，也不得用 `base = 0` 默认值——root struct 位于 `root_off` 而非 0。
 
 ### 7.3 Kotlin 访问器（示例）
 
@@ -640,15 +747,11 @@ public struct PersonView {
 // AUTO-GENERATED — do not edit
 // Source schema: Person (schema_name_hash: 0x9C3F1A2B)
 
-class PersonView(private val buf: java.nio.ByteBuffer, private val base: Int = 0) {
-
-    // pool_data 基址，构造时算好并缓存
-    private val poolData: Int
-
-    init {
-        buf.order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        poolData = buf.getInt(8) + 8
-    }
+class PersonView internal constructor(
+    private val buf: java.nio.ByteBuffer,
+    private val base: Int,
+    private val poolData: Int,          // pool_data 基址，沿 View 链传递
+) {
 
     // Fixed field: id (u64) at base+8
     val id: Long get() = buf.getLong(base + 8)
@@ -670,12 +773,21 @@ class PersonView(private val buf: java.nio.ByteBuffer, private val base: Int = 0
     // Variable field: address — VOT index 1
     val address: AddressView get() {
         val off = buf.getInt(base + VOT_START + 4)
-        return AddressView(buf, base + off)
+        return AddressView(buf, base + off, poolData)   // ← 显式传递 pool
         // AddressView 对象在 JVM 堆分配，但字段数据仍在 off-heap buffer
     }
 
     companion object {
-        private const val VOT_START = 8 + 4 * 8  // 由 codegen 填入
+        // = 8 + slot_count_fixed(=4) * 8（注意是槽位数 4，不是 fixed 字段数 5），由 codegen 填入
+        private const val VOT_START = 8 + 4 * 8
+
+        /** Root 工厂：从 Header 读一次 root_off 与 pool 基址 */
+        fun of(buf: java.nio.ByteBuffer): PersonView {
+            buf.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val rootOff  = buf.getInt(12)      // root_off
+            val poolData = buf.getInt(8) + 8   // pool_data
+            return PersonView(buf, rootOff, poolData)
+        }
     }
 }
 ```
@@ -725,7 +837,10 @@ var sum: f32 = 0;
 for (arr) |v| sum += v;
 // LLVM 自动生成 AVX2 VADDPS（每次处理 8 个 f32）
 // 前提：buffer 基地址 32B 对齐（allocator 硬性保证），
-//       uniform 数组数据区 32B 相对对齐（见 4.6），可用 aligned load
+//       大 uniform 数组数据区 32B 对齐（writer 把数组头放在 32k+24，见 4.6）
+// 注：slice 只声明元素自然对齐，LLVM 发 vmovups；收益来自避免
+//     cache-line split，而非指令选择——在 Haswell+ / Apple Silicon 上
+//     unaligned 指令访问已对齐数据与 aligned 指令同吞吐。
 ```
 
 ### 8.3 读取时：动态对象字段查找
@@ -738,9 +853,9 @@ for (arr) |v| sum += v;
 
 ### 对齐要求
 
-- Buffer allocator 统一保证 **32B 对齐**（v0.3 起为硬性要求）：这是 uniform 数组数据区 32B 相对对齐的前提，同时覆盖所有字段的自然对齐需求
-- Uniform 数组数据区固定从数组头 +32 开始（见 4.6），SIMD 循环无 cache-line split
-- 若外语侧 FFI 只能保证 8B 对齐（如 JVM direct ByteBuffer），uniform 数组退化为 unaligned load（现代 CPU 上惩罚很小），标量路径不受影响
+- Buffer allocator 统一保证 **32B 对齐**（v0.3 起为硬性要求）：这是 uniform 数组数据区 32B 对齐的前提，同时覆盖所有字段的自然对齐需求
+- Uniform 数组数据区固定从**数组头 +8** 开始；`count × sizeof ≥ 32` 时 writer 把数组头放在 struct_buf 绝对偏移 `32k+24`，使数据区落在 32B 边界，SIMD 循环无 cache-line split（见 4.6）
+- 访问器不做 `@alignCast(32)`，只声明元素自然对齐。因此若外语侧 FFI 只能保证 8B 对齐（如 JVM direct ByteBuffer），**不构成 UB**，仅退化为可能的 cache-line split（现代 CPU 上惩罚很小），标量路径完全不受影响
 
 ---
 
@@ -793,13 +908,17 @@ z_lib/build.zig 添加构建步骤：
 | 字符串存储 | 集中 String Pool + u32 直接偏移 | 去重、NUL 结尾与 C FFI 兼容、单次 load 访问（无 index 间接层，v0.3 移除） |
 | 固定字段布局 | comptime 计算偏移，8B 等步长槽，保持声明顺序 | O(1) 单 load；声明顺序让 schema 作者控制 cache line 局部性（8B 等步长下按大小排序无对齐收益） |
 | sub-word 打包 | 贪心装箱进 8B 槽，按对齐边界排列 | 节省空间的同时保持 comptime 可计算的确定性偏移 |
-| optional null 标记（≤32 位类型） | bit 63 of 8B slot | 无额外 bitmap，单次 AND+branch，不影响值精度 |
+| optional null 标记（≤32 位类型） | bit 63 of 8B slot，值**零扩展**（严禁符号扩展） | 无额外 bitmap，单次 AND+branch，不影响值精度；零扩展规则消除负数误置 bit 63 的陷阱 |
 | optional null 标记（u64/i64/f64） | 降级至 Variable 组，VOT = 0xFFFF_FFFF | bit 63 被值本身占满，无空余位，必须外置 null 标记 |
-| schema_name_hash | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
 | 可变字段导航 | Variable Offset Table (VOT) | O(1) 定位，VOT 本身 comptime 已知 |
-| 数组格式 | uniform（标量/字符串）/ non-uniform（struct）路径 | uniform 路径支持直接 SIMD slice；字符串数组视作 4B 元素的 uniform 数组 |
-| uniform 数组对齐 | 数据区固定 32B 对齐（数组头 +32） | SIMD aligned load 无 cache-line split；代价 ≤24B/数组 padding（性能优先于体积） |
+| 对齐判定基准 | struct_buf **绝对偏移**（VOT 只记相对增量） | 相对本 struct 头判定在嵌套场景下会失效（VOT 条目不保证是 32 的倍数） |
+| 数组格式 | uniform（标量/字符串）/ non-uniform（struct）路径 | uniform 路径支持直接 SIMD slice；字符串数组视作 4B 元素的 uniform 数组（pool 去重 ⟹ 比较 string_off 即可 SIMD 判等） |
+| 数组数据区位置 | 恒定在数组头 +8（三条路径统一） | 访问器无分支、偏移为 comptime 常量 |
+| uniform 数组对齐 | 大数组头落在 32k+24（数据区 32B 对齐）；`count×sizeof < 32` 豁免为 8B | 消除 v0.4 头内固定 24B 浪费，开销降至 ≤31B/数组；小数组填不满向量，强制对齐反而拉长 cache line 距离 |
 | 访问器上下文 | View{buf, base, pool} 三字 | init 缓存 pool 基址，每次字符串访问省一次 header load |
+| 外语 View 构造 | 双构造器（public root 读 Header / internal 嵌套接收 poolData） | root 位于 root_off 而非 0；pool 沿 View 链传递，嵌套不重读 Header |
+| schema_name_hash | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
+| Writer 机制 | reserve-then-backfill 三阶段 | VOT 在固定区、子对象在尾部，预留后定点回填即可单次遍历完成，无 fixup 链 |
 | 动态类型 | 可选 ZValue tape | 仅在需要动态 JSON-like 数据时引入，主路径无开销 |
 | **Schema 演化** | **v1 不支持（有意识取舍）** | **见下文说明** |
 | Schema 定义 | Zig 原生 struct + comptime | 无 IDL 文件，类型系统统一，无阻抗失配 |
@@ -850,7 +969,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 
 4. **String Pool 构建的内存使用**：序列化时 StringInterner 需要临时哈希表存储所有已见字符串。对于大量小对象的批量序列化，此哈希表的内存峰值是否可接受？是否需要提供"禁用去重"的快速路径选项？
 
-5. **对齐保证与外语传递**：v0.3 起 allocator 需保证 **32B 对齐**（硬性要求）。通过 FFI 传递给外语时，需外语侧不把 buffer 复制到低对齐内存（JVM direct ByteBuffer 通常只保证 8/16B；Swift 手动分配可达 32B）。若外语侧只能保证 8B，uniform 数组 SIMD 退化为 unaligned load（现代 CPU 惩罚很小），标量路径不受影响。此降级策略是否可接受？
+5. **对齐保证与外语传递**：v0.3 起 allocator 需保证 **32B 对齐**（硬性要求）。通过 FFI 传递给外语时，需外语侧不把 buffer 复制到低对齐内存（JVM direct ByteBuffer 通常只保证 8/16B；Swift 手动分配可达 32B）。由于 v0.5 起访问器不做 `@alignCast(32)`（只声明元素自然对齐），低对齐**不构成 UB**，仅可能产生 cache-line split（现代 CPU 惩罚很小），标量路径不受影响。此降级策略是否可接受？
 
 6. **TypeScript 路径**：`DataView` 的字段访问开销比原生高约 3-5 倍。是否考虑提供 WASM 桥接选项（由 Zig 编译到 WASM，通过 `wasm-bindgen` 风格 glue 暴露给 JS），以在 TS 侧获得接近原生的性能？
 
@@ -867,6 +986,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 | v0.3 | 性能修订（原则：性能 > 体积）：字符串去 index 间接层（值槽直接存 pool 偏移，访问 2 load → 1 load，省 index[] 区）；fixed 槽保持声明顺序（作者控制 cache line 局部性，替代按大小排序）；View 增加缓存 pool 基址；uniform 数组数据区固定 32B 对齐（数组头 +32，allocator 硬性 32B 对齐）；sub-word optional 明确独占槽（消除 Step 2 与 Step 3 的矛盾）；Swift/Kotlin 示例与 4.5 对齐（score 非 optional、age 返回类型、补 uid 访问器） |
 | v0.3.1 | 评审澄清（格式不变）：4.3 明确 pool_data 起点为 Pool 头 +8 并决策保留 string_count（仅 debug/校验）；4.4 显式声明 VOT 偏移基准为本 struct 头；optional sub-word 归入 Step 1 按声明顺序分配；full-width optional 数据块明确为动态分配（排除静态保留）；4.6 明确 uniform 数组 32B 对齐中 writer 的填充职责；6.3 补充 Writer 两段式写入顺序及组装时 root_off 的 32B 补齐 |
 | v0.4 | 评审修订：Struct Header 的 field_count_fixed 更名为 slot_count_fixed 并明确槽位语义（vot_start 公式仅槽位语义下成立）；4.6 新增 uniform string 路径（[][]const u8 = 4B string_off 元素的 uniform 数组）；4.4 新增 variable data 区对齐规则（子对象 8B 对齐落位，保证所有 struct base 为 8 的倍数）；6.3 伪代码重写为两段式模型；6.4 明确单一 pool 不变量；string_count 用途限定为 debug 构建校验与内省 |
+| v0.5 | **正确性修订**：① 修复嵌套 struct 内 uniform 数组的 32B 对齐失效 bug——对齐判定改为基于 struct_buf **绝对偏移**（VOT 仅记录相对增量），v0.4 的"相对本 struct 头对齐"在嵌套场景下不成立（VOT 条目只保证 8B）；② 4.4 Step 3 新增 optional 位编码规则，明确值须**零扩展**、**严禁符号扩展**（否则 `?i32 = -1` 会误置 bit 63 被读成 null）。**格式优化**：③ 数组数据区统一为数组头 +8（三条路径一致），大数组头改落在 `32k+24` 使数据区天然 32B 对齐，消除 v0.4 头内固定 24B 浪费（每数组开销 ≤55B → ≤31B），`count×sizeof < 32` 的小数组豁免为 8B 对齐；④ 访问器改为只声明元素自然对齐、不 `@alignCast(32)`，消除外语侧低对齐 UB 风险；flags bit1 记录对齐状态但仅供 debug。**表述收紧**：⑤ 合并 VOT `pad to 8B` 与子对象对齐为唯一一条规则（前者标注为派生结果）；⑥ 6.3 明确 Writer 的 reserve-then-backfill 三阶段（RESERVE / FIXED / VARIABLE）并重写伪代码；⑦ Swift/Kotlin 改为双构造器（public root 从 Header 读 root_off，internal 嵌套显式接收 poolData），修正 `base = 0` 与漏传 pool 两个 bug |
 
 ---
 
