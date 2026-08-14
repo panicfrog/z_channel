@@ -261,48 +261,77 @@ Schema 定义：
 
 ```zig
 const Person = struct {
-    id:      u64,
-    age:     u8,
-    active:  bool,
-    score:   f32,
-    name:    []const u8,      // → string_handle（fixed）
-    tags:    [][]const u8,    // → string array（variable）
-    address: Address,         // → 嵌套 struct（variable）
+    id:      u64,          // u64，独占槽
+    score:   f32,          // f32，独占槽
+    name:    []const u8,   // string，独占槽（string_handle = u32）
+    age:     u8,           // sub-word
+    active:  bool,         // sub-word
+    tags:    [][]const u8, // variable
+    address: Address,      // variable（嵌套 struct）
+    uid:     ?u64,         // optional full-width → variable
 };
 ```
 
-内存布局：
+**comptime 分组结果**：
+
+```
+独占槽（Step 1，对齐降序）：
+  id      → u64，槽 0
+  score   → f32，槽 1（低4B，高4B=0）
+  name    → string_handle u32，槽 2（低4B，高4B=0）
+
+sub-word 打包（Step 2，贪心装箱）：
+  age(u8) + active(bool) → 槽 3 的 byte0 + byte1，其余补零
+
+Variable 组（VOT）：
+  VOT[0] → tags
+  VOT[1] → address
+  VOT[2] → uid（?u64，full-width optional，0xFFFF_FFFF = null）
+```
+
+**内存布局**：
 
 ```
 Offset  大小   内容
-──────  ─────  ──────────────────────────────────────────
-0       8B     Struct Header（field_count_fixed=4, field_count_var=2）
-8       8B     Fixed 槽 0：id（u64）
-16      8B     Fixed 槽 1：score（f32，存低4B）
-24      8B     Fixed 槽 2：name（string_handle，存低4B）
-32      8B     Fixed 槽 3：age（byte0）+ active（byte1）打包
+──────  ─────  ────────────────────────────────────────────────────
+0       8B     Struct Header（field_count_fixed=4, field_count_var=3, schema_name_hash）
+8       8B     Fixed 槽 0：id（u64，8B）
+16      8B     Fixed 槽 1：score（f32，低4B；高4B = 0）
+24      8B     Fixed 槽 2：name（string_handle u32，低4B；高4B = 0）
+32      8B     Fixed 槽 3：[byte0=age][byte1=active][byte2-7=0]
 40      4B     VOT[0]：tags 相对本 struct 头的偏移
 44      4B     VOT[1]：address 相对本 struct 头的偏移
-48      ?      tags array 数据（inline）
+48      4B     VOT[2]：uid 相对本 struct 头的偏移（0xFFFF_FFFF = null）
+52      4B     (pad to 8B)
+56      ?      tags array 数据（inline）
 ?       ?      address struct 数据（inline）
+?       8B     uid 数据块（内联的 u64，仅当 VOT[2] ≠ 0xFFFF_FFFF 时存在）
 ```
 
-访问 `person.age`：
+**访问示例**：
 
 ```
-age = *(u8*)(buf + struct_base + 32)   // 单条 load，偏移为 comptime 常量
+// person.age — 单条 load（byte 偏移为 comptime 常量）
+age = *(u8*)(buf + struct_base + 32 + 0)
+
+// person.active — 单条 load
+active = *(u8*)(buf + struct_base + 32 + 1) != 0
+
+// person.score — 单条 load
+score = *(f32*)(buf + struct_base + 16)
+
+// person.uid（?u64）— 读 VOT，判空，再读值
+uid_vot = *(u32*)(buf + struct_base + 48)
+if uid_vot == 0xFFFF_FFFF → null
+else → *(u64*)(buf + struct_base + uid_vot)
+
+// person.address.street — 两级 VOT + 固定槽
+addr_off      = *(u32*)(buf + struct_base + 44)
+street_handle = *(u32*)(buf + struct_base + addr_off + STREET_SLOT_OFFSET)
+str_ptr       = pool_data + index[street_handle]
 ```
 
-访问 `person.address.street`：
-
-```
-addr_off   = *(u32*)(buf + struct_base + 44)          // VOT[1]
-street_off = struct_base + addr_off + fixed_slot_N    // 子 struct 固定槽
-street_handle = *(u32*)(buf + street_off)             // string_handle
-str_ptr = pool_data + index[street_handle]            // 字符串指针
-```
-
-全程无分配，无哈希查找，无类型断言。
+全程无分配，无哈希查找，无类型断言。所有偏移均为 comptime 常量。
 
 ---
 
@@ -686,15 +715,31 @@ z_lib/build.zig 添加构建步骤：
 |---|---|---|
 | 偏移方式 | 纯相对偏移（u32） | Position-independent，可 mmap / 落盘 / 跨进程 |
 | 字符串存储 | 集中 String Pool + u32 handle | 去重、NUL 结尾与 C FFI 兼容、handle 尺寸小 |
-| 固定字段布局 | comptime 计算偏移，8B 等步长 | O(1) 单 load 访问，LLVM 折叠偏移计算 |
-| Null 标记 | bit 63 of 8B slot | 无额外 null bitmap，单次 AND+branch |
+| 固定字段布局 | comptime 计算偏移，8B 等步长槽 | O(1) 单 load 访问，LLVM 折叠偏移计算 |
+| sub-word 打包 | 贪心装箱进 8B 槽，按对齐边界排列 | 节省空间的同时保持 comptime 可计算的确定性偏移 |
+| optional null 标记（≤32 位类型） | bit 63 of 8B slot | 无额外 bitmap，单次 AND+branch，不影响值精度 |
+| optional null 标记（u64/i64/f64） | 降级至 Variable 组，VOT = 0xFFFF_FFFF | bit 63 被值本身占满，无空余位，必须外置 null 标记 |
+| struct_id | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
 | 可变字段导航 | Variable Offset Table (VOT) | O(1) 定位，VOT 本身 comptime 已知 |
 | 数组格式 | uniform/non-uniform 双路径 | uniform 路径支持直接 SIMD slice |
 | 动态类型 | 可选 ZValue tape | 仅在需要动态 JSON-like 数据时引入，主路径无开销 |
+| **Schema 演化** | **v1 不支持（有意识取舍）** | **见下文说明** |
 | Schema 定义 | Zig 原生 struct + comptime | 无 IDL 文件，类型系统统一，无阻抗失配 |
 | 外语代码生成 | 构建时 codegen（Zig 可执行文件） | IDE 友好（有类型、有补全），无运行时反射开销 |
 | Swift 实现方式 | UnsafeRawBufferPointer + Macro | 与 Swift 类型系统融合，访问器代码简洁 |
 | Kotlin 实现方式 | ByteBuffer（direct/off-heap） | 无 GC 压力，JIT 可 inline 为单条 load |
+
+### Schema 演化的立场
+
+ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/删除/重排字段）。这是一个**有意识的取舍**，不是遗漏：
+
+- 所有字段偏移在 comptime 固化，任何 schema 变更都会导致二进制不兼容
+- 收益：每个字段访问是真正的单条 load，无 vtable 跳转，无 presence 检查
+- 代价：生产者和消费者必须使用完全相同的 schema 版本
+- **适用场景**：同一代码库内不同语言组件（共享同一套 schema 定义，统一编译部署）；短生命周期的进程间消息（消息不落盘）
+- **不适用场景**：需要长期落盘存储、需要滚动升级（不同版本客户端同时存在）
+
+如未来需要演化能力，可在 v2 引入可选的 FlatBuffers 风格 vtable（`field_present_bitmap` + 间接寻址），作为独立的 schema mode，不影响 v1 的零开销路径。
 
 ---
 
@@ -719,21 +764,28 @@ z_lib/build.zig 添加构建步骤：
 
 以下问题需要在技术评审中确认：
 
-1. **字节序**：当前设计假设 little-endian（bit2 标志）。是否需要支持 big-endian 目标（如某些嵌入式平台）？如需支持，访问器是否在读取时做字节序转换，还是序列化时统一为网络字节序？
+1. **字节序**：当前设计假设 little-endian（flags bit2 标记）。是否需要支持 big-endian 目标？如需支持，建议序列化时统一为 little-endian（与主流平台一致），读端在 big-endian 机器上做 byteswap，开销仅在读取时发生。
 
-2. **u32 偏移上限（4GiB）**：是否有超过 4GiB 的单个 buffer 需求？如有，需改为 u64 偏移，代价是每个 VOT 条目和 string handle 翻倍。
+2. **u32 偏移上限（4GiB）**：是否有超过 4GiB 的单个 buffer 需求？如有，需改为 u64 偏移，代价是 VOT 条目和 string handle 各扩大一倍（每个从 4B 变为 8B）。
 
-3. **Schema 演化（版本兼容性）**：当前设计不支持字段的增删（字段偏移在 comptime 固化）。是否需要支持前向/后向兼容性？若需要，参考 FlatBuffers vtable 方案（增加每个字段的存在性检查，牺牲部分性能）。
+3. **嵌套 struct 内联 vs 引用**：当前设计将嵌套 struct 数据内联在父 struct 的 variable data 区。如果同一 Address 对象被多个 Person 引用，会产生重复数据。是否需要支持引用语义（VOT 条目指向 buffer 内任意位置而非仅父 struct 内部）？这会允许去重，但会增加指针追踪层数。
 
-4. **嵌套 struct 内联 vs 引用**：当前设计将嵌套 struct 数据内联在父 struct 的 variable data 区。对于被多个父 struct 共享的子 struct（如同一 Address 被多人引用），是否需要支持引用语义（共享同一块子 struct 数据）？
+4. **String Pool 构建的内存使用**：序列化时 StringInterner 需要临时哈希表存储所有已见字符串。对于大量小对象的批量序列化，此哈希表的内存峰值是否可接受？是否需要提供"禁用去重"的快速路径选项？
 
-5. **String Pool 构建的内存使用**：序列化时 StringInterner 需要临时哈希表存储所有已见字符串。对于大量小对象的批量序列化，此哈希表的内存峰值是否可接受？
+5. **对齐保证与外语传递**：buffer allocator 需提供至少 8B 对齐（最优 32B）。通过 FFI 传递给外语时，需外语侧保证不把 buffer 内容复制到不对齐的内存中（如 JVM byte[] 不保证 8B 对齐，使用 direct ByteBuffer 可保证）。此约束是否可接受？
 
-6. **对齐保证**：生成的 buffer 需要 allocator 提供至少 8B 对齐，最优 32B 对齐（AVX2）。通过 FFI 传递给外语时，需要外语侧保证不重新分配到不对齐的内存中，这一约束是否可以接受？
+6. **TypeScript 路径**：`DataView` 的字段访问开销比原生高约 3-5 倍。是否考虑提供 WASM 桥接选项（由 Zig 编译到 WASM，通过 `wasm-bindgen` 风格 glue 暴露给 JS），以在 TS 侧获得接近原生的性能？
 
-7. **TypeScript 路径**：TypeScript 通过 `DataView` 访问 `ArrayBuffer`，性能低于原生。是否需要 WASM 桥接（在 WASM 模块中运行 Zig 生成的访问器代码，通过 JS interop 暴露）？
+7. **动态路径（ZValue tape）的优先级**：是否有在 v1 中支持动态路径的具体使用场景？如无，建议推迟到 v2，保持 v1 范围专注于 schema-typed 路径。
 
-8. **动态路径（ZValue tape）的优先级**：当前设计中动态路径是可选的。是否有明确的使用场景需要在第一版中支持动态路径？
+---
+
+## 13. 变更记录
+
+| 版本 | 修改内容 |
+|---|---|
+| v0.1 | 初稿 |
+| v0.2 | 修正 optional u64/f64 编码（降级至 Variable 组）；统一 sub-word 字段打包规则为贪心装箱；struct_id 从 u16 改为 u32 FNV-32a 并明确仅供 debug；明确 schema 演化为有意识的 v1 边界；更新 4.5 示例使其与规则一致 |
 
 ---
 
