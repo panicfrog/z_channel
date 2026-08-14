@@ -1,7 +1,7 @@
 # ZigPack：零拷贝跨语言二进制序列化格式
 
 > **状态**：设计草稿，待技术评审
-> **版本**：v0.3（性能修订：字符串去间接层、槽序声明顺序、View 缓存 pool 基址、uniform 数组 32B 对齐）
+> **版本**：v0.3.1（评审澄清：VOT 偏移基准、optional 槽位归属、full-width optional 动态分配、uniform 数组 writer 填充职责、Writer 两段式写入、string_count 保留决策；二进制格式与 v0.3 一致）
 > **作者**：待填写
 > **日期**：2026-08-14
 
@@ -141,13 +141,17 @@ Offset  大小                内容
 8       pool_byte_len B     pool_data[]：紧密排列的 NUL 结尾 UTF-8 字符串
 ```
 
+**pool_data 起点固定为 Pool 头 +8**（跳过 `pool_byte_len` 4B + `string_count` 4B）。View.init 缓存的基址即 `poolData = string_pool_off + 8`，与 6.4 / 7.2 的示例代码一致。
+
 **字符串偏移（string_off）**：值槽中**直接**存储该字符串在 `pool_data` 内的字节偏移（u32），没有中间索引层。访问路径为一次 load：
 
 ```
 string_off → pool_data[string_off]   （pool_data 基址由 View.init 缓存，见 6.4）
 ```
 
-写入端 `StringInterner` 按插入顺序向 pool_data 追加字符串，偏移在插入时即确定（= 追加前的 pool_data 长度），因此写入值槽的偏移就是最终偏移，**无需序列化收尾 fixup**。
+写入端 `StringInterner` 按插入顺序向 pool_data 追加字符串，偏移在插入时即确定（= 追加前的 pool_data 长度），因此写入值槽的偏移就是最终偏移，**无需序列化收尾 fixup**。成立前提是 pool_data 独立于其在 buffer 中的最终位置构建（所有偏移相对 pool_data 自身起点），Writer 的写入顺序见 6.3。
+
+**string_count 的取舍**：v0.3 移除 index[] 后，string_count 不再参与读取路径，仅用于 debug / 完整性校验（如线性扫描 pool_data 数出的字符串数应与之相等）。**决策：保留**——每 buffer 固定 4B 成本，换取内省与校验能力；读取热路径完全不触碰该字段。
 
 > v0.1–v0.2 曾使用 handle → index[] → pool_data 两级间接。该间接层在读取端零收益（去重发生在写入端），却使每次字符串访问多一次依赖 load，且 index[] 每字符串多耗 4B。v0.3 移除。
 
@@ -169,6 +173,8 @@ Offset  大小                        内容
 ```
 
 > **关于 `schema_name_hash`**：从 16 位改为 32 位（FNV-32a of type name），仅用于 debug / 运行时 assert，**不作为安全校验**（碰撞概率 ~1/4B，校验严格性不足；如需严格校验应比较完整 type name 字符串）。32 位相比 16 位碰撞概率下降 65536 倍，误报率在调试场景可接受。
+
+> **VOT 偏移基准**：所有 VOT 条目均为**相对本 struct 头**（Struct Header 起点，即访问代码中的 `struct_base`）的 u32 字节偏移，**不是**相对 buffer 头。所有语言的访问统一为 `buf + struct_base + vot_entry`（嵌套 struct 的子 base 同理由父 base + VOT 条目得出）。`0xFFFF_FFFF` 保留为 null 哨兵，不占用偏移空间（buffer 上限 4GiB，实际可达偏移 < 0xFFFF_FFFF）。
 
 ---
 
@@ -209,7 +215,13 @@ Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时�
 
 **Step 1：独占槽字段分配（保持声明顺序）**
 
-独占槽字段（`u64/i64/f64`、`u32/i32/f32/string_off` 及全部 non-full-width optional）按**声明顺序**依次分配 8B 槽，低位存值，高位补零。
+以下字段各自独占一个 8B 槽，**统一按声明顺序**依次分配（低位存值，高位补零）：
+
+- `u64 / i64 / f64`
+- `u32 / i32 / f32 / string_off`
+- 全部 non-full-width optional：`?u32`、`?i32`、`?f32`、`?string_off`、`?u16`、`?i16`、`?u8`、`?i8`、`?bool`
+
+**optional sub-word（`?u8`、`?bool` 等）视同独占槽字段，在本步骤按声明顺序与其他独占槽字段混合分配，不进入 Step 2 的装箱。**
 
 理由：8B 等步长槽位下所有槽自然 8B 对齐，按类型大小排序没有任何对齐收益；保持声明顺序把 cache-line 局部性的控制权交给 schema 作者——高频字段排在前面即可挤进同一条 cache line（64B = 8 个槽），这是本设计缓存友好性的直接控制点。
 
@@ -220,7 +232,7 @@ Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时�
 - 每个槽可容纳的字节位置：`byte 0..7`（共 8 字节）
 - 按 **对齐边界** 将字段放入当前槽：u16 放 2B 对齐位置，u8/bool 放任意字节位置
 - 当前槽装不下时，开启新槽
-- **optional sub-word 字段不参与装箱**，一律独占 8B 槽、bit 63 做 null 标记（见 Step 3）——同一槽内多个 optional 无法共用 bit 63，必须独占
+- optional sub-word 字段**不参与装箱**（已在 Step 1 独占槽分配，bit 63 做 null 标记，见 Step 3）——同一槽内多个 optional 无法共用 bit 63，必须独占
 - 每个字段的字节偏移（相对所在槽起点）由 comptime 计算并记录在 FieldMeta 中
 
 **Step 3：optional null 标记**
@@ -228,7 +240,7 @@ Fixed 组按以下规则排列，**所有决定在 comptime 完成，运行时�
 - non-full-width optional（`?u32`、`?u16`、`?u8`、`?bool` 等）：**bit 63 = 1** 表示 null，其余位存实际值。此方案对这些类型安全，因为：
   - `?u32`：低 32 位存值，bit 63 为 null 标记，中间 31 位置零，无冲突
   - `?u16/u8/bool`：值更小，高位空间更充裕
-- full-width optional（`?u64`、`?i64`、`?f64`）：**降级至 Variable 组**，VOT 条目 = `0xFFFF_FFFF` 表示 null，有值时指向一个内联的 8B 数据块
+- full-width optional（`?u64`、`?i64`、`?f64`）：**降级至 Variable 组，数据块动态分配**——null 时**不写入任何数据块**，VOT 条目 = `0xFFFF_FFFF`；非 null 时在 variable data 区按字段声明顺序追加一个 8B 数据块，VOT 条目指向它。不存在静态保留槽：静态保留会使 VOT 条目永远非 `0xFFFF_FFFF`，与 null 哨兵语义冲突，故明确排除。
 
 ---
 
@@ -304,7 +316,7 @@ Offset  大小   内容
 52      4B     (pad to 8B)
 56      ?      tags array 数据（inline）
 ?       ?      address struct 数据（inline）
-?       8B     uid 数据块（内联的 u64，仅当 VOT[2] ≠ 0xFFFF_FFFF 时存在）
+?       8B     uid 数据块（内联的 u64，动态分配：仅当 VOT[2] ≠ 0xFFFF_FFFF 时存在，null 时整个数据块不写入）
 ```
 
 **访问示例**：
@@ -355,7 +367,17 @@ Offset  大小                内容
 ?       element data[]              各元素 inline struct 数据
 ```
 
-**uniform 数组的 32B 对齐**：writer 将 uniform 数组头放置在 32B 相对对齐的位置（buffer 基地址的 32B 对齐由 allocator 保证，见 8），数据区固定从数组头 +32 开始——偏移是常量，访问器无需运行时计算；SIMD 循环可使用 aligned load，无 cache-line split。代价是每个 uniform 数组固定 24B padding（性能优先于体积的取舍）。
+**uniform 数组的 32B 对齐**：数据区固定从数组头 +32 开始——偏移是常量，访问器无需运行时计算；SIMD 循环可使用 aligned load，无 cache-line split。对齐成立的条件链为：
+
+```
+buffer 基地址 32B 对齐（allocator 硬性保证，见 8）
+  → 组装时 Pool 段末尾补齐，使 root_off 为 32 的倍数（见 6.3）
+  → writer 在写入 uniform 数组前插入最多 31B 填充，
+    使数组头相对 struct 段起点落在 32B 边界       ← writer 的显式职责
+  → 数组头 +32 的数据区在最终 buffer 中 32B 对齐
+```
+
+variable data 区是连续追加的，数组头不会自然落在 32B 边界，**这步填充必须由 writer 主动完成**。VOT 条目指向填充之后的数组头，读取端永远看不到填充。代价：每个 uniform 数组最多 31B（头部对齐填充）+ 24B（头内 8→32 填充）≈ 55B 开销（性能优先于体积的取舍）。
 
 **uniform 标志的意义**：标记为 uniform 的数组，其数据区是一段连续的同类型标量，访问器直接返回对应 Zig/C/Swift slice，调用方可以直接 SIMD 处理，无任何 per-element 开销。
 
@@ -469,6 +491,14 @@ fn generateWriter(comptime T: type) type {
 ```
 
 `inline for` 强制 LLVM 为每个字段特化代码，消除运行时分支和虚函数调用。
+
+**Writer 写入顺序（两段式）**：最终 buffer 布局是 Header → String Pool → Root Struct，但字符串只有在遍历 struct 时才会被发现（Pool 无法先写完），因此 Writer 采用两段式构建：
+
+1. **struct 段**：将 root struct（含全部嵌套数据）序列化到独立的临时缓冲。期间每遇到字符串就调用 `StringInterner.intern()`，把返回的最终偏移直接写入值槽——偏移相对 pool_data 自身起点，与 struct 段最终摆放位置无关，**struct 段无任何 fixup**。
+2. **pool 段**：String Pool 始终在独立的 pool_data 缓冲中增量构建（intern 时追加，偏移即时确定），与 struct 段并行推进。
+3. **组装**：全部字段写完后，按 Header(16B) + Pool + struct 段输出最终 buffer，回填 Header：`string_pool_off = 16`，`root_off = 16 + pool_total_len`。组装时 struct 段发生一次 memcpy（序列化的一次性成本，可接受）。
+
+> **root_off 的 32B 补齐**：struct 段内的所有对齐（含 uniform 数组的 32B 对齐填充）都是相对 struct 段起点计算的，而 struct 段在最终 buffer 中位于 `root_off = 16 + pool_total_len`，pool 长度不定。因此组装时必须在 Pool 段末尾补齐 padding（最多 31B），使 `root_off` 为 32 的倍数——这样 struct 段内的相对对齐在最终 buffer 中原样生效，struct 段本身无需感知自己在 buffer 中的位置。
 
 ### 6.4 View（零拷贝访问器）生成
 
@@ -816,6 +846,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 | v0.1 | 初稿 |
 | v0.2 | 修正 optional u64/f64 编码（降级至 Variable 组）；统一 sub-word 字段打包规则为贪心装箱；struct_id 从 u16 改为 u32 FNV-32a 并明确仅供 debug；明确 schema 演化为有意识的 v1 边界；更新 4.5 示例使其与规则一致 |
 | v0.3 | 性能修订（原则：性能 > 体积）：字符串去 index 间接层（值槽直接存 pool 偏移，访问 2 load → 1 load，省 index[] 区）；fixed 槽保持声明顺序（作者控制 cache line 局部性，替代按大小排序）；View 增加缓存 pool 基址；uniform 数组数据区固定 32B 对齐（数组头 +32，allocator 硬性 32B 对齐）；sub-word optional 明确独占槽（消除 Step 2 与 Step 3 的矛盾）；Swift/Kotlin 示例与 4.5 对齐（score 非 optional、age 返回类型、补 uid 访问器） |
+| v0.3.1 | 评审澄清（格式不变）：4.3 明确 pool_data 起点为 Pool 头 +8 并决策保留 string_count（仅 debug/校验）；4.4 显式声明 VOT 偏移基准为本 struct 头；optional sub-word 归入 Step 1 按声明顺序分配；full-width optional 数据块明确为动态分配（排除静态保留）；4.6 明确 uniform 数组 32B 对齐中 writer 的填充职责；6.3 补充 Writer 两段式写入顺序及组装时 root_off 的 32B 补齐 |
 
 ---
 
