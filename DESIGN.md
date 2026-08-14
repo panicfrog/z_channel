@@ -1,7 +1,7 @@
 # ZigPack：零拷贝跨语言二进制序列化格式
 
 > **状态**：设计草稿，待技术评审
-> **版本**：v0.5.2（正确性修订：对齐判定改用 struct_buf 绝对偏移、optional 零扩展位编码；格式优化：数组数据区统一 +8、uniform 大数组头落 32k+24；表述收紧：Writer 四阶段、外语双构造器、non-uniform 元素泛化为任意子对象）
+> **版本**：v0.5.3（正确性修订：对齐判定改用 struct_buf 绝对偏移、optional 零扩展位编码；格式优化：数组数据区统一 +8、uniform 大数组头落 32k+24；补全 TypeTag 单一枚举定义；表述收紧：Writer 四阶段、外语双构造器）
 > **作者**：待填写
 > **日期**：2026-08-14
 
@@ -394,7 +394,7 @@ str_ptr    = pool_data + street_off
 Offset  大小                内容
 ──────  ──────────────────  ──────────────────────────────────
 0       4B                  element_count: u32
-4       2B                  element_type: u16（TypeTag 枚举值）
+4       2B                  element_type: u16（TypeTag 枚举值，高 8 位为 0，见下）
 6       2B                  flags: u16（bit0: uniform，bit1: data_32b_aligned）
 
 [uniform scalar path，如 []f32、[]i64]
@@ -411,11 +411,53 @@ Offset  大小                内容
 
 **数据区永远位于数组头 +8**——uniform 路径的裸元素区、non-uniform 路径的 offset_table 都从 +8 开始。访问器无分支、偏移恒为 comptime 常量，三条路径共用同一条寻址公式。
 
-**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（element_type 取 TypeTag 的 String 值，见 5.1），元素紧密连续、无 per-element 头。访问器可返回 `[]const u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。
+**字符串数组的归类**：`[][]const u8` 等**字符串数组走 uniform 路径**——每个元素是 4B 的 `string_off`，本质上是 `sizeof(T) = 4` 的 uniform 数组（`element_type = String (0x30)`，`sizeof(elem) = 4`，见下方 TypeTag 表），元素紧密连续、无 per-element 头。访问器可返回 `[]const u32` 偏移视图（调用方逐个解引用），也可提供惰性字符串迭代器。
+
+> **字符串数组做 SIMD 对齐为何有意义**：String Pool 做了去重，因此**字符串相等 ⟺ string_off 相等**。`tags.contains(s)` 可退化为：先 `intern(s)` 得到 u32 偏移，再对 `[]const u32` 做 SIMD 相等比较（AVX2 一次比 8 个），完全不触碰 pool_data。这使 uniform string array 的向量化有真实业务语义，对齐收益成立。
 
 **non-uniform 路径的元素可以是任意变长子对象**：嵌套 struct 数组（`[]Address`）的元素是子 struct；**嵌套数组**（`[][]f32`、`[][]Address`）的元素是完整的子数组（含自己的 8B 数组头 + 数据区，`element_type = Array`）。两者共用同一套机制——offset_table 定位 + 4.4 的统一落位规则，递归任意深度成立，格式无需为嵌套数组增加特例。
 
-> **字符串数组做 SIMD 对齐为何有意义**：String Pool 做了去重，因此**字符串相等 ⟺ string_off 相等**。`tags.contains(s)` 可退化为：先 `intern(s)` 得到 u32 偏移，再对 `[]const u32` 做 SIMD 相等比较（AVX2 一次比 8 个），完全不触碰 pool_data。这使 uniform string array 的向量化有真实业务语义，对齐收益成立。
+---
+
+#### element_type：TypeTag 枚举（全格式单一定义）
+
+`TypeTag` 是**两条路径共用的唯一类型标签定义**，实现上位于 `format.zig`（见 9）。全部取值 ≤ `0xFF`，因此同一套值既能填进数组头的 `element_type: u16`（高 8 位保留为 0），也能填进 ZValue tape 的 8 位 `TYPE_TAG` 字段（见 5.1），**不存在两套编号**。
+
+| 值 | 名称 | uniform | `sizeof(elem)` | 适用路径 | 说明 |
+|---|---|---|---|---|---|
+| `0x00` | Null | ✗ | — | 仅 tape | schema 路径的 null 由 bit 63 / VOT 哨兵表达，不用标签 |
+| `0x01` | False | ✗ | — | 仅 tape | tape 把布尔值编进标签本身 |
+| `0x02` | True | ✗ | — | 仅 tape | 同上 |
+| `0x03` | Bool | ✓ | 1 | 仅 schema | `[]bool` 的元素类型；tape 侧用 False/True 代替 |
+| `0x08` | Int8 | ✓ | 1 | 两者 | |
+| `0x09` | Int16 | ✓ | 2 | 两者 | |
+| `0x0A` | Int32 | ✓ | 4 | 两者 | |
+| `0x0B` | Int64 | ✓ | 8 | 两者 | tape 中占 2 个槽，见 5.1 |
+| `0x0C` | UInt8 | ✓ | 1 | 两者 | |
+| `0x0D` | UInt16 | ✓ | 2 | 两者 | |
+| `0x0E` | UInt32 | ✓ | 4 | 两者 | |
+| `0x0F` | UInt64 | ✓ | 8 | 两者 | tape 中占 2 个槽 |
+| `0x20` | Float32 | ✓ | 4 | 两者 | |
+| `0x21` | Float64 | ✓ | 8 | 两者 | tape 中占 2 个槽 |
+| `0x30` | String | ✓ | 4 | 两者 | 元素是 u32 `string_off`；pool 去重 ⟹ 可直接 SIMD 判等 |
+| `0x40` | Array | ✗ | — | 两者 | 变长子对象 ⟹ non-uniform 路径（嵌套数组） |
+| `0x50` | Object | ✗ | — | 仅 tape | 动态键值对象 |
+| `0x51` | Struct | ✗ | — | 仅 schema | 嵌套 struct ⟹ non-uniform 路径 |
+
+由此得到两条派生规则，实现时不需要额外查表：
+
+```
+uniform(tag)  ⟺  sizeof(elem) 在上表中有定义
+              ⟺  tag ∈ {Bool, Int8..UInt64, Float32, Float64, String}
+              （即 tag ∉ {Null, False, True, Array, Object, Struct}）
+
+4.6 落位判定所需的 element_count × sizeof(elem)
+              仅在 uniform(tag) 成立时有意义 —— 与"non-uniform 一律 8B"自洽
+```
+
+> **`flags bit0: uniform` 与 `element_type` 是冗余的一致信息**：writer 必须保证两者一致（`bit0 = uniform(element_type)`）。reader 走 `bit0`（单次测位比范围判断便宜），debug 构建可 assert 两者相符。
+>
+> **schema-typed 路径只在这一处使用 TypeTag**：固定槽不存类型标签（类型 comptime 已知，见 5.2），Struct Header 也不存。数组头的 `element_type` 是格式中唯一的运行时类型标签——保留它是为了让通用工具（dump、校验器、跨语言 reader 的断言）无需 schema 也能解析数组。此外 `SchemaDescriptor` 的 `type_tag` 字段（见 7.1）使用同一枚举，供 codegen 生成外语访问器。
 
 ---
 
@@ -487,22 +529,27 @@ Bits 63..56   Bits 55..32   Bits 31..0
 └───────────┴─────────────┴──────────────┘
 ```
 
-TYPE_TAG 值定义：
+TYPE_TAG 取值**直接复用 4.6 的 TypeTag 枚举**（同一套编号，全部 ≤ `0xFF`，恰好填满 8 位标签字段）。tape 路径实际会用到的子集及其 PAYLOAD 语义：
 
 ```
-0x00  Null
-0x01  False  / 0x02  True
-0x12  Int32（payload = i32 值）
-0x13  Int64（下一个 8B 存 i64 值，共 16B）
-0x14..0x17  UInt 系列
-0x20  Float32（payload = f32 bits）
-0x21  Float64（下一个 8B 存 f64 值，共 16B）
-0x30  String（payload = pool_data 内偏移 u32）
-0x40  Array（payload = 相对 tape 起点的偏移）
-0x50  Object（payload = 相对 tape 起点的偏移）
+0x00  Null              payload 忽略
+0x01  False / 0x02 True 布尔值编在标签内，payload 忽略
+0x08  Int8   ┐
+0x09  Int16  ├─ payload = 值的位模式【零扩展】到低 32 位
+0x0A  Int32  ┘  （与 4.4 Step 3 同一条零扩展规则，避免符号扩展污染 AUX 字段）
+0x0C  UInt8 / 0x0D UInt16 / 0x0E UInt32   payload = 值
+0x20  Float32           payload = f32 bits
+0x0B  Int64  ┐
+0x0F  UInt64 ├─ 下一个 8B 槽存完整 64 位值，共 16B（见下）
+0x21  Float64┘
+0x30  String            payload = pool_data 内偏移（u32 string_off，与 schema 路径同源）
+0x40  Array             payload = 相对 tape 起点的偏移
+0x50  Object            payload = 相对 tape 起点的偏移
 ```
 
-Int64 和 Float64 占用连续两个 8B 槽（共 16B），类型标签始终在首个槽，便于线性扫描时 O(1) 跳过。
+tape 路径**不使用** `0x03 Bool`（用 False/True 代替）与 `0x51 Struct`（动态路径无 schema，用 Object）；schema 路径不使用 `0x00/0x01/0x02/0x50`。两条路径共用一个枚举、各取子集，**不存在编号冲突或双重定义**。
+
+`Int64` / `UInt64` / `Float64` 占用连续两个 8B 槽（共 16B），类型标签始终在首个槽，便于线性扫描时 O(1) 跳过。
 
 ### 5.2 Schema-Typed 固定槽（不存类型标签）
 
@@ -696,7 +743,7 @@ Zig 构建步骤（b.addRunArtifact）
 
 SchemaDescriptor 内容：
   type_name、schema_name_hash、slot_count_fixed、vot_start
-  每个字段：name、type_tag、byte_offset 或 vot_index、nullable
+  每个字段：name、type_tag（TypeTag 枚举值，见 4.6）、byte_offset 或 vot_index、nullable
 ```
 
 ### 7.2 Swift 访问器（示例）
@@ -913,7 +960,7 @@ for (arr) |v| sum += v;
 z_channel/
 ├── z_core/src/
 │   ├── root.zig           对外重导出
-│   ├── format.zig         常量：magic、TypeTag 枚举、Header struct
+│   ├── format.zig         常量：magic、TypeTag 枚举（4.6 单一定义，两条路径共用）、Header struct
 │   ├── layout.zig         comptime 布局计算（FieldMeta、computeLayout）
 │   ├── writer.zig         comptime Writer 生成（序列化器）
 │   ├── view.zig           comptime View 生成（零拷贝访问器）
@@ -967,6 +1014,7 @@ z_lib/build.zig 添加构建步骤：
 | 外语 View 构造 | 双构造器（public root 读 Header / internal 嵌套接收 poolData） | root 位于 root_off 而非 0；pool 沿 View 链传递，嵌套不重读 Header |
 | schema_name_hash | u32 FNV-32a hash，仅供 debug assert | 16 位碰撞率过高；u32 降至可接受；不作安全校验 |
 | Writer 机制 | reserve-then-backfill 四阶段 | VOT 在固定区、子对象在尾部，预留后定点回填即可单次遍历完成，无 fixup 链 |
+| 类型标签 | TypeTag 单一枚举（≤ 0xFF），schema 路径仅用于数组 `element_type`，tape 路径用于 8 位 TYPE_TAG | 一套编号两条路径共用子集，无双重定义；`sizeof(elem)` 与 `uniform` 均由标签派生，无需额外查表 |
 | 动态类型 | 可选 ZValue tape | 仅在需要动态 JSON-like 数据时引入，主路径无开销 |
 | **Schema 演化** | **v1 不支持（有意识取舍）** | **见下文说明** |
 | Schema 定义 | Zig 原生 struct + comptime | 无 IDL 文件，类型系统统一，无阻抗失配 |
@@ -1037,6 +1085,7 @@ ZigPack v1 **不支持**在同一 buffer 格式内进行 schema 演化（新增/
 | v0.5 | **正确性修订**：① 修复嵌套 struct 内 uniform 数组的 32B 对齐失效 bug——对齐判定改为基于 struct_buf **绝对偏移**（VOT 仅记录相对增量），v0.4 的"相对本 struct 头对齐"在嵌套场景下不成立（VOT 条目只保证 8B）；② 4.4 Step 3 新增 optional 位编码规则，明确值须**零扩展**、**严禁符号扩展**（否则 `?i32 = -1` 会误置 bit 63 被读成 null）。**格式优化**：③ 数组数据区统一为数组头 +8（三条路径一致），大数组头改落在 `32k+24` 使数据区天然 32B 对齐，消除 v0.4 头内固定 24B 浪费（每数组开销 ≤55B → ≤31B），`count×sizeof < 32` 的小数组豁免为 8B 对齐；④ 访问器改为只声明元素自然对齐、不 `@alignCast(32)`，消除外语侧低对齐 UB 风险；flags bit1 记录对齐状态但仅供 debug。**表述收紧**：⑤ 合并 VOT `pad to 8B` 与子对象对齐为唯一一条规则（前者标注为派生结果）；⑥ 6.3 明确 Writer 的 reserve-then-backfill 阶段划分并重写伪代码；⑦ Swift/Kotlin 改为双构造器（public root 从 Header 读 root_off，internal 嵌套显式接收 poolData），修正 `base = 0` 与漏传 pool 两个 bug |
 | v0.5.1 | 评审补漏：① 4.4 对齐规则扩展为覆盖**所有子对象**（含 non-uniform 数组的元素区子 struct），以表格形式列出各类子对象的对齐需求；② 4.6 落位规则明确**仅 uniform 路径**适用 `32k+24`，non-uniform 一律 8B（元素逐个访问无整块 SIMD，且 `sizeof(elem)` 对变长元素无定义）；③ 6.3 三阶段补为**四阶段**，新增 HEADER 阶段（slot_count_fixed / field_count_var / schema_name_hash 此前无人写入），并补充数组序列化同构说明；④ 修正 4.5 注释——本例 `56` 同时满足 8B 与 `32k+24`，大小数组落点相同属巧合，非普遍规律；⑤ §12 问题 2 措辞更新（"string handle" → `string_off`，并补充 u64 偏移会使 `?string_off` 失去 bit 63 的连带影响）；⑥ 7.3 补 Kotlin `name` 访问器与 NUL 扫描成本说明，7.4 表同步细化 |
 | v0.5.2 | 措辞补全（格式不变）：① 4.4 表格与 4.6 non-uniform 路径的"子 struct"放宽为"变长子对象（子 struct **或嵌套 array**）"，显式覆盖 `[][]f32` / `[][]Address`——机制原本已支持（元素即任意子对象，落位规则递归复用），仅措辞收窄；补充嵌套 array 元素本身若是 uniform 大数组仍按 `32k+24` 落位、对齐链正常向下传递；② 6.3 统一阶段编号（代码注释的 2a/2b 改为与正文一致的 2 HEADER / 3 FIXED / 4 VARIABLE，子步骤记为 4a–4d） |
+| v0.5.3 | 补全 TypeTag 定义：4.6 新增 `element_type：TypeTag 枚举（全格式单一定义）` 完整取值表（含 uniform 标记与 `sizeof(elem)` 列），并派生出 `uniform(tag)` 与落位判定的适用条件，明确 `flags bit0` 与 `element_type` 是冗余一致信息（writer 保证一致、reader 走 bit0、debug 断言）；补 `0x03 Bool` 与 `0x51 Struct`（原 5.1 列表缺失，`[]bool` 与嵌套 struct 数组无标签可用）；5.1 的 ad-hoc 标签列表改为复用同一枚举、只声明 tape 侧 PAYLOAD 语义与两路径各自不用的取值（原 `0x12/0x13/0x14..0x17` 编号与 `0x14..0x17 UInt 系列` 的模糊表述废止），并明确 tape 整数 payload 同样适用 4.4 Step 3 的零扩展规则；4.6 布局图、7.1 SchemaDescriptor、9 `format.zig` 同步指向 4.6 的单一定义；§10 新增"类型标签"决策行 |
 
 ---
 
