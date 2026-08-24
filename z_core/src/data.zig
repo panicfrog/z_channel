@@ -141,6 +141,20 @@ pub const DynamicDataIndex = union(enum) {
     }
 };
 
+pub fn get_id(value: anytype) ?u16 {
+    const T = @TypeOf(value);
+    const filed_name = "z_core_id";
+    if (@hasField(T, filed_name)) {
+        const FT = @TypeOf(@field(value, filed_name));
+        if (FT != u16) {
+            return null;
+        }
+        return @field(value, filed_name);
+    } else {
+        return null;
+    }
+}
+
 test "comptime is_primitive_datatype" {
     comptime {
         // 1. bool
@@ -249,4 +263,29 @@ test "DynamicDataIndex encode" {
         // 65535 = 0xFFFF -> [0xFF, 0xFF], 300 = 0x012C -> [0x2C, 0x01]
         try std.testing.expectEqual(buf[0..8].*, [_]u8{ 2, 0, 0, 0, 0xff, 0xff, 0x2c, 0x01 });
     }
+}
+
+test "test get_id" {
+    const MyStruct = struct {
+        z_core_id: u16 = 42,
+        a: i32,
+    };
+    const my_struct_instance = MyStruct{ .a = 10 };
+    const id = get_id(my_struct_instance);
+    try std.testing.expect(id.? == 42);
+
+    const MyStructWithoutId = struct {
+        a: i32,
+    };
+    const my_struct_without_id_instance = MyStructWithoutId{ .a = 10 };
+    const id2 = get_id(my_struct_without_id_instance);
+    try std.testing.expect(id2 == null);
+
+    const MyStructWithWrongIdType = struct {
+        z_core_id: i32 = 42, // wrong type
+        a: i32,
+    };
+    const my_struct_with_wrong_id_type_instance = MyStructWithWrongIdType{ .a = 10 };
+    const id3 = get_id(my_struct_with_wrong_id_type_instance);
+    try std.testing.expect(id3 == null);
 }
