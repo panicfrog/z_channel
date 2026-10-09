@@ -1,4 +1,36 @@
 const std = @import("std");
+const z_core_error = @import("error.zig").ZCoreError;
+
+pub const String = struct {
+    bytes: []const u8,
+
+    pub fn init(bytes: []const u8) !String {
+        if (!std.unicode.utf8ValidateSlice(bytes)) {
+            return z_core_error.InvalidUtf8;
+        }
+        return .{ .bytes = bytes };
+    }
+
+    pub fn formLiteral(comptime literal: []const u8) String {
+        return .{ .bytes = literal };
+    }
+
+    pub fn eql(self: String, other: String) bool {
+        return std.mem.eql(u8, self, other);
+    }
+
+    pub fn charCount(self: String) !usize {
+        return try std.unicode.utf8CountCodepoints(self.bytes);
+    }
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{s}", .{self.bytes});
+    }
+};
+
 // only string bool int float null is considered primitive datatype
 pub fn is_primitive_datatype(comptime value_type: type) bool {
     const info = @typeInfo(value_type);
@@ -62,8 +94,8 @@ pub fn is_datatype(comptime value_type: type) bool {
             }
         },
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                if (!is_datatype(field.type)) {
+            inline for (s.field_types) |field_type| {
+                if (!is_datatype(field_type)) {
                     return false;
                 }
             } else {
@@ -75,8 +107,8 @@ pub fn is_datatype(comptime value_type: type) bool {
         },
         .@"enum" => return true,
         .@"union" => |tu| {
-            inline for (tu.fields) |field| {
-                if (field.type == @TypeOf(null) or !is_datatype(field.type)) {
+            inline for (tu.field_types) |field_type| {
+                if (field_type == @TypeOf(null) or !is_datatype(field_type)) {
                     return false;
                 }
             } else {
