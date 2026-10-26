@@ -23,7 +23,8 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    // `zig build run -- arg1 arg2` 会把 `--` 后的参数透传给程序
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the example");
     run_step.dependOn(&run_cmd.step);
